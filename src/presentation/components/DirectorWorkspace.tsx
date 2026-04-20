@@ -149,9 +149,11 @@ function fileToBase64(file: File): Promise<string> {
 
 /**
  * Sandbox の git log から得た commit 情報で localStorage の items を整合させる。
- * - apply commit が見つかった instruction は `applied` + commitSha に昇格
- * - revert commit が見つかった instruction は `reverted` に更新
- * - git log に無い submitted/running は localStorage のまま残す (まだ commit 前かもしれない)
+ * - apply commit が見つかった instruction → `applied` + commitSha に昇格
+ * - revert commit が見つかった instruction → `reverted` に更新
+ * - git log に無い `submitted` / `running` → サーバー応答を取り逃がしたケース
+ *   ページ再読み込みを跨いだ時点で fetch は既に切れているので、そのままだと
+ *   永遠に「AI 処理中」表示が残ってしまう。`failed` に降格して再送信を促す。
  */
 function reconcileFromGitLog(
   existing: ChatItem[],
@@ -163,8 +165,6 @@ function reconcileFromGitLog(
     committedAt: number;
   }[],
 ): ChatItem[] {
-  if (commits.length === 0) return existing;
-  // instruction_id ごとの最新 commit 種別を決める
   const latestByInstruction = new Map<
     string,
     { sha: string; kind: "apply" | "revert"; committedAt: number }
@@ -181,17 +181,28 @@ function reconcileFromGitLog(
   }
   return existing.map((item) => {
     const latest = latestByInstruction.get(item.id);
-    if (!latest) return item;
-    if (latest.kind === "revert") {
-      return { ...item, status: "reverted" as const };
+    if (latest) {
+      if (latest.kind === "revert") {
+        return { ...item, status: "reverted" as const };
+      }
+      if (item.status === "applied" && item.commitSha === latest.sha) return item;
+      return {
+        ...item,
+        status: "applied" as const,
+        commitSha: latest.sha,
+      };
     }
-    // apply
-    if (item.status === "applied" && item.commitSha === latest.sha) return item;
-    return {
-      ...item,
-      status: "applied" as const,
-      commitSha: latest.sha,
-    };
+    // git log に無い submitted はページ再読み込み時点で迷子扱い。
+    if (item.status === "submitted") {
+      return {
+        ...item,
+        status: "failed" as const,
+        errorMessage:
+          item.errorMessage ??
+          "サーバーからの応答を受け取れませんでした。コミット履歴にも記録がないため、同じ内容を新しい指示として追加し直してください。",
+      };
+    }
+    return item;
   });
 }
 
@@ -271,6 +282,7 @@ export function DirectorWorkspace({
   const [closeModalOpen, setCloseModalOpen] = useState(false);
   const [selectMode, setSelectMode] = useState(false);
   const [revertingItemId, setRevertingItemId] = useState<string | null>(null);
+  const [restartingDevServer, setRestartingDevServer] = useState(false);
   const [lastResultMessage, setLastResultMessage] = useState<string | null>(
     initialSession
       ? `案件 ${initialSession.recordNumber} (${initialSession.partnerName}) を復元しました`
@@ -521,6 +533,30 @@ export function DirectorWorkspace({
           : event.message?.slice(0, 120),
         error: event.status === "failed",
       });
+      // 実 item の status も即座に更新。result イベントの到着を待たない。
+      // 途中でストリームが切れても UI が「AI 処理中」で固まらないようにする。
+      const terminalStatus =
+        event.status === "applied" ||
+        event.status === "failed" ||
+        event.status === "unclear" ||
+        event.status === "reverted";
+      if (terminalStatus) {
+        setItems((prev) =>
+          prev.map((item) => {
+            if (item.id !== event.instructionId) return item;
+            const isFailed =
+              event.status === "failed" || event.status === "unclear";
+            return {
+              ...item,
+              status: event.status as ChatItemStatus,
+              commitSha: event.commitSha ?? item.commitSha,
+              errorMessage: isFailed
+                ? event.message ?? item.errorMessage
+                : item.errorMessage,
+            };
+          }),
+        );
+      }
     } else if (event.kind === "toolCall") {
       pushLog({
         kind: "toolCall",
@@ -621,6 +657,37 @@ export function DirectorWorkspace({
       await fetch("/api/auth/signout", { method: "POST" });
     } finally {
       window.location.replace("/login");
+    }
+  }
+
+  async function handleRestartDevServer(): Promise<void> {
+    if (!loadedCase || restartingDevServer) return;
+    setRestartingDevServer(true);
+    setLastResultMessage("開発サーバーを再起動中... (最大 3 分)");
+    try {
+      const resp = await fetch("/api/sessions/restart-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: loadedCase.sessionId }),
+      });
+      const data = (await resp.json()) as { ok: boolean; message?: string };
+      if (data.ok) {
+        previewKeyRef.current += 1;
+        setPreviewKey(previewKeyRef.current);
+        setLastResultMessage(
+          data.message ?? "開発サーバーを再起動しました。",
+        );
+      } else {
+        setLastResultMessage(
+          data.message ?? "開発サーバーの再起動に失敗しました。",
+        );
+      }
+    } catch (error) {
+      setLastResultMessage(
+        error instanceof Error ? error.message : "通信エラーが発生しました",
+      );
+    } finally {
+      setRestartingDevServer(false);
     }
   }
 
@@ -748,20 +815,15 @@ export function DirectorWorkspace({
         />
       )}
       <div className="flex flex-1 min-h-0">
-        <div className="flex flex-col flex-1 min-w-0 min-h-0">
-          <PreviewPane
-            previewUrl={loadedCase?.previewUrl ?? null}
-            onElementSelected={handleElementSelected}
-            reloadKey={previewKey}
-            selectMode={selectMode}
-            onSelectModeReset={() => setSelectMode(false)}
-          />
-          <LogDrawer
-            entries={logEntries}
-            running={running}
-            onClear={() => setLogEntries([])}
-          />
-        </div>
+        <PreviewPane
+          previewUrl={loadedCase?.previewUrl ?? null}
+          onElementSelected={handleElementSelected}
+          reloadKey={previewKey}
+          selectMode={selectMode}
+          onSelectModeReset={() => setSelectMode(false)}
+          onRestartDevServer={handleRestartDevServer}
+          restartingDevServer={restartingDevServer}
+        />
         <ChatPane
           items={items}
           pendingSelectors={pendingSelectors}
@@ -780,6 +842,11 @@ export function DirectorWorkspace({
           selectModeAvailable={!!loadedCase?.previewUrl}
         />
       </div>
+      <LogDrawer
+        entries={logEntries}
+        running={running}
+        onClear={() => setLogEntries([])}
+      />
     </div>
   );
 }

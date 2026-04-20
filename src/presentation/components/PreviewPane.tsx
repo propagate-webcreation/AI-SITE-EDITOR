@@ -18,6 +18,10 @@ interface PreviewPaneProps {
   selectMode: boolean;
   /** 要素選択完了 / キャンセル / Esc などで選択モードを外したいとき */
   onSelectModeReset: () => void;
+  /** Sandbox 内の dev server を再起動する。クリックで /api/sessions/restart-preview を叩く想定 */
+  onRestartDevServer?: () => void;
+  /** 再起動処理中の表示切替 */
+  restartingDevServer?: boolean;
 }
 
 const VIEWPORT_WIDTH = 1440;
@@ -29,6 +33,8 @@ export function PreviewPane({
   reloadKey = 0,
   selectMode,
   onSelectModeReset,
+  onRestartDevServer,
+  restartingDevServer = false,
 }: PreviewPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -113,6 +119,17 @@ export function PreviewPane({
           <span className="mx-1 text-[#55555c]">·</span>
           {Math.round(scale * 100)}%
         </span>
+        {onRestartDevServer && (
+          <button
+            type="button"
+            onClick={onRestartDevServer}
+            disabled={!previewUrl || restartingDevServer}
+            className="inline-flex items-center justify-center h-[26px] px-2.5 rounded-md border border-[#3a3a3f] bg-[#1b1b1d] text-[11px] font-medium text-[#a9a9b0] hover:border-amber-500/60 hover:text-amber-200 hover:bg-amber-500/5 disabled:opacity-40 disabled:cursor-not-allowed transition whitespace-nowrap"
+            title="Sandbox 内の Next.js dev server を再起動します。プレビューが応答しなくなったときに使用。"
+          >
+            {restartingDevServer ? "再起動中..." : "開発サーバー再起動"}
+          </button>
+        )}
         {selectMode && (
           <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/40 text-[10px] font-medium text-amber-200">
             <span className="font-mono text-amber-400">&lt;/&gt;</span>

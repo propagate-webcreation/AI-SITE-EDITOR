@@ -112,6 +112,71 @@ export class VercelSandboxManager {
   }
 
   /**
+   * Sandbox 内の Next.js dev server を再起動する。
+   * AI の修正で dev が process 落ちした / OOM / stuck 等、プレビューが応答しなくなった
+   * ケースのリカバリー用。Sandbox 自体は生かしたままで、中の dev プロセスだけ
+   * bounce する。
+   *
+   * 戻り値: dev が ready になったかどうか。false なら再度 UI に失敗表示を出す。
+   */
+  async restartDevServer(params: {
+    sandboxId: string;
+    devPort?: number;
+    readyTimeoutMs?: number;
+  }): Promise<{ ok: boolean; message?: string }> {
+    const sandbox = await Sandbox.get({
+      ...this.credsArg(),
+      sandboxId: params.sandboxId,
+    });
+    const devPort = params.devPort ?? 3000;
+    const readyTimeoutMs = params.readyTimeoutMs ?? 180_000;
+
+    // 1. 既存の next dev プロセスを殺す (pattern マッチ、無ければ無視)
+    //    + そのポートを掴んでいるプロセスも念のため kill。
+    const killCmd = [
+      `pkill -f 'next dev' || true`,
+      `pkill -f 'next-server' || true`,
+      `fuser -k ${devPort}/tcp || true`,
+      `sleep 1`,
+    ].join(" && ");
+    await sandbox
+      .runCommand({
+        cmd: "bash",
+        args: ["-lc", killCmd],
+      })
+      .catch(() => undefined);
+
+    // 2. 新しく起動 (detached で走らせ、stdout/stderr は Sandbox 側ログに流す)
+    try {
+      await sandbox.runCommand({
+        cmd: "npm",
+        args: ["run", "dev", "--", "-p", String(devPort)],
+        detached: true,
+        env: { PORT: String(devPort), BROWSER: "none" },
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        message: `dev server の起動コマンドに失敗: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
+    // 3. ポートが応答するまで待つ
+    try {
+      await waitForDevServer(sandbox, devPort, readyTimeoutMs);
+      return { ok: true };
+    } catch (error) {
+      return {
+        ok: false,
+        message:
+          error instanceof Error
+            ? error.message
+            : `dev server が ${readyTimeoutMs}ms 以内に応答しませんでした`,
+      };
+    }
+  }
+
+  /**
    * Sandbox 内の git log から `directors-bot: <recordNumber> <instructionId>` 形式の
    * 修正コミットを列挙する。案件を閉じずにタブ/セッションが切れたとき、
    * client 側で localStorage の submitted 状態を applied に昇格させるために使う。
@@ -135,10 +200,13 @@ export class VercelSandboxManager {
     const sandbox = await Sandbox.get({ ...this.credsArg(), sandboxId });
 
     const LOG_DELIM = "\x1fEND_COMMIT\x1f";
+    // -E (ERE) モード。( ) ? はメタ文字としてそのまま使える。
+    // apply commit: `directors-bot: <record> <instr>`
+    // revert commit: `revert directors-bot: <record> <instr>`
     const shellCmd = [
       `cd ${DEFAULT_CWD}`,
       // `%H` sha / `%ct` commit time (epoch) / `%B` body
-      `git log --grep='^\\(revert \\)\\?directors-bot: ' --extended-regexp ` +
+      `git log -E --grep='^(revert )?directors-bot: ' ` +
         `--format='%H%x1f%ct%x1f%B${LOG_DELIM}'`,
       `echo "==STATUS=="`,
       `git status --porcelain`,
