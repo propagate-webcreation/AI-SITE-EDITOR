@@ -32,6 +32,13 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+!.env.example
+
+# cloned sites for agent work (local dev)
+/tmp/
+
+# credentials (google service account 等)
+/credentials/
 
 # vercel
 .vercel
@@ -39,3 +46,5 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+.vercel

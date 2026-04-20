@@ -1,65 +1,96 @@
-import Image from "next/image";
+import { Sandbox } from "@vercel/sandbox";
+import { DirectorWorkspace } from "@/presentation/components/DirectorWorkspace";
+import {
+  createSupabaseAdminClient,
+  createSupabaseServerClient,
+} from "@/infrastructure/supabase/supabaseClients";
+import { SupabaseSessionRepository } from "@/infrastructure/supabase/supabaseSessionRepository";
+import type { Session } from "@/domain/models";
+import type { SessionRepositoryPort } from "@/domain/ports";
 
-export default function Home() {
+export default async function HomePage() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  let directorEmail: string | null = null;
+  let initialSession = null;
+
+  if (url && anonKey && serviceRoleKey) {
+    const supabase = await createSupabaseServerClient({
+      url,
+      anonKey,
+      serviceRoleKey,
+    });
+    const { data } = await supabase.auth.getUser();
+    directorEmail = data.user?.email ?? null;
+
+    if (data.user) {
+      const admin = createSupabaseAdminClient({
+        url,
+        anonKey,
+        serviceRoleKey,
+      });
+      const repo = new SupabaseSessionRepository(admin);
+      const active = await repo.listActiveByDirector(data.user.id);
+      const latest = active[0];
+      if (latest) {
+        if (new Date(latest.expiresAt) <= new Date()) {
+          await markSessionExpired(repo, latest);
+        } else if (!(await isSandboxAlive(latest.sandboxId))) {
+          await markSessionExpired(repo, latest);
+        } else {
+          initialSession = {
+            sessionId: latest.id,
+            recordNumber: latest.recordNumber,
+            partnerName: latest.partnerName,
+            contractPlan: latest.contractPlan,
+            githubRepoUrl: latest.githubRepoUrl,
+            previewUrl: latest.previewUrl,
+            expiresAt: latest.expiresAt.toISOString(),
+          };
+        }
+      }
+    }
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    <DirectorWorkspace
+      directorEmail={directorEmail}
+      initialSession={initialSession}
+    />
   );
+}
+
+/**
+ * Vercel API で Sandbox が生きているか確認する。
+ * preview URL の HTTP 応答は middleware リダイレクト等の影響で false 判定されやすいので、
+ * Vercel 側の API で sandbox レコードの存在だけを見る。
+ */
+async function isSandboxAlive(sandboxId: string): Promise<boolean> {
+  const token = process.env.VERCEL_TOKEN;
+  const teamId = process.env.VERCEL_TEAM_ID;
+  const projectId = process.env.VERCEL_PROJECT_ID;
+  if (!token || !teamId || !projectId) return true; // 設定不足時は真として通す
+  try {
+    await Sandbox.get({ token, teamId, projectId, sandboxId });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function markSessionExpired(
+  repo: SessionRepositoryPort,
+  session: Session,
+): Promise<void> {
+  try {
+    await repo.updateStatus({
+      id: session.id,
+      status: "expired",
+      closedAt: new Date(),
+    });
+  } catch {
+    /* best effort */
+  }
 }
