@@ -162,7 +162,7 @@ export function ChatPane({
               <>修正中...</>
             ) : (
               <>
-                AI に修正させる
+                AI修正実行
                 {draftCount > 0 && (
                   <span className="ml-0.5 px-1 rounded bg-[#0b0b0d]/25 text-[10px] tabular-nums">
                     {draftCount}
@@ -344,22 +344,19 @@ export function ChatPane({
               </span>
             )}
           </label>
-          <label
-            className={`flex-1 cursor-pointer inline-flex items-center justify-center gap-1.5 h-[30px] rounded-md border text-[11px] transition ${
+          <button
+            type="button"
+            onClick={() => setIsGlobal((v) => !v)}
+            aria-pressed={isGlobal}
+            className={`flex-1 inline-flex items-center justify-center gap-1.5 h-[30px] rounded-md border text-[11px] transition ${
               isGlobal
                 ? "border-violet-500/70 bg-violet-500/10 text-violet-200"
                 : "border-[#3a3a3f] bg-[#1b1b1d] text-[#a9a9b0] hover:border-violet-500/60 hover:text-violet-300"
             }`}
-            title="チェックすると、他の指示がすべて完了した後にこの指示だけ単独で実行されます。サイト全体のトーン変更などに。"
+            title="押すと、他の指示がすべて完了した後にこの指示だけ単独で実行されます。サイト全体のトーン変更などに。"
           >
-            <input
-              type="checkbox"
-              checked={isGlobal}
-              onChange={(e) => setIsGlobal(e.target.checked)}
-              className="chk"
-            />
             全体指示
-          </label>
+          </button>
           <button
             type="submit"
             disabled={!comment.trim()}
