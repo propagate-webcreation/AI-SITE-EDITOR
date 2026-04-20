@@ -79,25 +79,27 @@ export function CaseLoader({ onLoaded }: CaseLoaderProps) {
 
   return (
     <form onSubmit={handleSubmit} className="flex items-center gap-2 min-w-0">
-      <label className="text-xs text-neutral-400">レコード番号</label>
+      <label className="text-xs text-[#a9a9b0] whitespace-nowrap">
+        レコード番号
+      </label>
       <input
         type="text"
         value={recordNumber}
         onChange={(e) => setRecordNumber(e.target.value)}
         placeholder="例: 001"
-        className="w-32 rounded bg-neutral-950 border border-neutral-700 px-2 py-1.5 text-sm text-neutral-100 focus:outline-none focus:border-emerald-500"
+        className="w-24 h-[30px] rounded-md bg-[#0f0f11] border border-[#3a3a3f] px-2 text-sm text-[#e8e8ea] placeholder:text-[#55555c] focus:outline-none focus:border-amber-500/50 transition disabled:opacity-50"
         disabled={loading}
       />
       <button
         type="submit"
         disabled={!recordNumber.trim() || loading}
-        className="px-3 py-1 rounded bg-emerald-500 text-white text-xs font-semibold disabled:bg-neutral-700 disabled:text-neutral-400 hover:bg-emerald-400 transition whitespace-nowrap"
+        className="inline-flex items-center justify-center h-[30px] px-3 rounded-md border border-amber-500/60 bg-amber-500/90 text-[#0b0b0d] text-xs font-semibold hover:bg-amber-400 disabled:bg-[#2b2b30] disabled:text-[#55555c] disabled:border-[#3a3a3f] transition whitespace-nowrap"
       >
         {loading ? "起動中..." : "案件を開く"}
       </button>
       {loading && (
-        <span className="text-xs text-neutral-400 animate-pulse truncate">
-          clone → npm install → dev server 起動中
+        <span className="text-xs text-[#a9a9b0] truncate">
+          clone → install → dev server 起動中
         </span>
       )}
       {error && (

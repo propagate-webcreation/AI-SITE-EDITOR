@@ -118,6 +118,14 @@ export class SupabaseSessionRepository implements SessionRepositoryPort {
       .eq("id", params.id);
     if (error) throw new Error(`Supabase session 更新に失敗: ${error.message}`);
   }
+
+  async deleteById(id: string): Promise<void> {
+    const { error } = await this.supabase
+      .from("sessions")
+      .delete()
+      .eq("id", id);
+    if (error) throw new Error(`Supabase session 削除に失敗: ${error.message}`);
+  }
 }
 
 function rowToSession(row: SessionRow): Session {

@@ -22,6 +22,7 @@ function makeSandboxMock() {
   return {
     readFile: vi.fn().mockResolvedValue("hello world"),
     writeFile: vi.fn().mockResolvedValue(undefined),
+    writeBinaryFile: vi.fn().mockResolvedValue(undefined),
     runCommand: vi.fn().mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 }),
   };
 }

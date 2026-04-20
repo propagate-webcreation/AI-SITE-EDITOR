@@ -1,7 +1,6 @@
 import "server-only";
 import path from "node:path";
 import type {
-  InstructionApplicationRepositoryPort,
   SessionRepositoryPort,
   SpreadsheetPort,
 } from "@/domain/ports";
@@ -13,7 +12,6 @@ import {
   createSupabaseServerClient,
 } from "@/infrastructure/supabase/supabaseClients";
 import { SupabaseSessionRepository } from "@/infrastructure/supabase/supabaseSessionRepository";
-import { SupabaseInstructionApplicationRepository } from "@/infrastructure/supabase/supabaseInstructionApplicationRepository";
 import {
   assertCaseLoadingEnv,
   assertCorrectionEnv,
@@ -80,7 +78,6 @@ export interface CorrectionContainer {
   sandbox: VercelSandboxManager;
   agentRunner: GeminiAgentRunner;
   sessions: SessionRepositoryPort;
-  applications: InstructionApplicationRepositoryPort;
   directorId: string;
 }
 
@@ -113,16 +110,12 @@ export async function buildCorrectionContainer(): Promise<CorrectionContainer> {
 
   const supabaseAdmin = createSupabaseAdminClient(env.supabase);
   const sessions = new SupabaseSessionRepository(supabaseAdmin);
-  const applications = new SupabaseInstructionApplicationRepository(
-    supabaseAdmin,
-  );
 
   return {
     env: env as CorrectionContainer["env"],
     sandbox,
     agentRunner,
     sessions,
-    applications,
     directorId: userData.user.id,
   };
 }

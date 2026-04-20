@@ -1,8 +1,6 @@
-import { NextResponse } from "next/server";
-import type {
-  InstructionApplicationRepositoryPort,
-  SessionRepositoryPort,
-} from "@/domain/ports";
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type {
   InstructionApplication,
   InstructionAttachmentMeta,
@@ -19,6 +17,8 @@ export interface CorrectionInstructionInput {
   comment: string;
   /** pin 機能は廃止。DB 互換のため null を保持。 */
   pinIndex: number | null;
+  /** 全体指示。true なら他の指示完了後に単独で順次実行される。 */
+  isGlobal?: boolean;
   attachments?: {
     filename: string;
     mimeType: string;
@@ -43,20 +43,67 @@ export interface GitCommitter {
     authorName: string;
     authorEmail: string;
     commitMessage: string;
+    pathSpec?: readonly string[];
   }): Promise<string | null>;
 }
 
 export interface CorrectionsControllerDependencies {
-  sessions: SessionRepositoryPort;
-  applications: InstructionApplicationRepositoryPort;
   runtimeProvider: RuntimeProvider;
   agentRunner: Pick<GeminiAgentRunner, "run">;
   committer: GitCommitter;
-  directorId: string;
   sandboxCwd: string;
   botAuthorName: string;
   botAuthorEmail: string;
+  /** 全体指示モード用のモデル名 (省略時は agentRunner が持つ既定モデル)。 */
+  globalModel?: string;
+  /**
+   * 進行状況イベントを受け取るコールバック。
+   * ルートハンドラ側でストリーミングレスポンスに変換するためのフック。省略可。
+   */
+  emit?: (event: CorrectionEvent) => void;
 }
+
+export type CorrectionEvent =
+  | {
+      kind: "phase";
+      phase: "prepare" | "regular" | "global" | "complete";
+      regularCount: number;
+      globalCount: number;
+    }
+  | {
+      kind: "instruction";
+      instructionId: string;
+      status:
+        | "queued"
+        | "running"
+        | "applied"
+        | "failed"
+        | "reverted"
+        | "unclear";
+      isGlobal: boolean;
+      message?: string;
+      commitSha?: string;
+    }
+  | {
+      kind: "toolCall";
+      instructionId: string;
+      name: string;
+      argsSummary: string;
+      success: boolean;
+      iteration: number;
+    }
+  | {
+      kind: "log";
+      level: "info" | "warn" | "error";
+      message: string;
+    }
+  | {
+      kind: "result";
+      ok: boolean;
+      message: string;
+      applications: ReturnType<typeof toClientApplication>[];
+      durationSec: number;
+    };
 
 interface ParsedBody {
   sessionId: string;
@@ -66,57 +113,95 @@ interface ParsedBody {
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const ACCEPTED_MIME_PREFIXES = ["image/"];
 
+/**
+ * バリデーション済み入力を受けて修正フェーズを流す。
+ * HTTP レベルのバリデーション (session 存在・所有権・active 状態) は
+ * route 側で完了している前提。ここでは例外はそのまま throw し、route が受け取る。
+ */
 export async function handleCorrectionsRequest(
-  request: Request,
+  input: {
+    session: {
+      id: string;
+      sandboxId: string;
+      recordNumber: string;
+      partnerName: string;
+      contractPlan: string;
+    };
+    instructions: CorrectionInstructionInput[];
+  },
   deps: CorrectionsControllerDependencies,
-): Promise<NextResponse> {
-  const parsed = await parseBody(request);
-  if ("error" in parsed) {
-    return NextResponse.json(
-      { ok: false, message: parsed.error },
-      { status: 400 },
-    );
-  }
-
-  const session = await deps.sessions.getById(parsed.sessionId);
-  if (!session) {
-    return NextResponse.json(
-      { ok: false, message: "セッションが見つかりません。案件を開き直してください。" },
-      { status: 404 },
-    );
-  }
-  if (session.directorId !== deps.directorId) {
-    return NextResponse.json(
-      { ok: false, message: "このセッションを扱う権限がありません。" },
-      { status: 403 },
-    );
-  }
-  if (session.status !== "active") {
-    return NextResponse.json(
-      {
-        ok: false,
-        message: `セッションは ${session.status} です。もう一度案件を開いてください。`,
-      },
-      { status: 410 },
-    );
-  }
-
-  const runtime = await deps.runtimeProvider.getRuntime(session.sandboxId);
+): Promise<{ ok: boolean; status: number; body: {
+  ok: boolean;
+  message: string;
+  applications: ReturnType<typeof toClientApplication>[];
+  durationSec: number;
+} }> {
+  const activeSession = input.session;
+  const runtime = await deps.runtimeProvider.getRuntime(activeSession.sandboxId);
   const start = Date.now();
   const results: InstructionApplication[] = [];
+  const emit = deps.emit ?? (() => {});
 
-  for (const inst of parsed.instructions) {
-    const existing = await deps.applications.getBySessionAndInstructionId({
-      sessionId: session.id,
-      instructionId: inst.id,
-    });
-    if (existing) {
-      // 既に適用済みの指示はスキップ (idempotent)
-      results.push(existing);
-      continue;
-    }
+  // instruction_applications は DB に保存せず、このリクエスト処理中だけ
+  // in-memory で保持する。案件を閉じたら状態ごと破棄する方針なので
+  // 永続化は不要 (client 側が localStorage に最終結果を保存する)。
+  const store = new Map<string, InstructionApplication>();
+  function createApp(params: {
+    instructionId: string;
+    comment: string;
+    pinIndex: number | null;
+    attachments: InstructionAttachmentMeta[];
+    orderIndex: number;
+    isGlobal: boolean;
+  }): InstructionApplication {
+    const now = new Date();
+    const app: InstructionApplication = {
+      id: randomUUID(),
+      sessionId: activeSession.id,
+      instructionId: params.instructionId,
+      comment: params.comment,
+      pinIndex: params.pinIndex,
+      attachments: params.attachments,
+      orderIndex: params.orderIndex,
+      isGlobal: params.isGlobal,
+      status: "running",
+      summary: null,
+      errorMessage: null,
+      commitSha: null,
+      revertCommitSha: null,
+      startedAt: now,
+      completedAt: null,
+      revertedAt: null,
+      createdAt: now,
+    };
+    store.set(app.id, app);
+    return app;
+  }
+  function updateApp(
+    id: string,
+    patch: Partial<InstructionApplication>,
+  ): InstructionApplication | null {
+    const cur = store.get(id);
+    if (!cur) return null;
+    const next = { ...cur, ...patch };
+    store.set(id, next);
+    return next;
+  }
 
-    const orderIndex = await deps.applications.nextOrderIndex(session.id);
+  // ---- Phase 1: 準備 ----
+  interface Prepared {
+    inst: CorrectionInstructionInput;
+    created: InstructionApplication;
+    orderIndex: number;
+    tracker: TrackingRuntime;
+    isGlobal: boolean;
+  }
+  const regulars: Prepared[] = [];
+  const globals: Prepared[] = [];
+
+  let orderCounter = 0;
+  for (const inst of input.instructions) {
+    const orderIndex = orderCounter++;
     const attachmentsMeta: InstructionAttachmentMeta[] = (inst.attachments ?? []).map(
       (a) => ({
         filename: a.filename,
@@ -124,120 +209,414 @@ export async function handleCorrectionsRequest(
         sizeBytes: base64Bytes(a.base64),
       }),
     );
-    const created = await deps.applications.create({
-      sessionId: session.id,
+    const isGlobal = !!inst.isGlobal;
+    const created = createApp({
       instructionId: inst.id,
       comment: inst.comment,
       pinIndex: inst.pinIndex,
       attachments: attachmentsMeta,
       orderIndex,
+      isGlobal,
+    });
+    emit({
+      kind: "instruction",
+      instructionId: inst.id,
+      status: "queued",
+      isGlobal,
     });
 
-    await deps.applications.update({
-      id: created.id,
-      status: "running",
-      startedAt: new Date(),
-    });
-
-    const userPrompt = buildUserPromptSingle({
-      recordNumber: session.recordNumber,
-      partnerName: session.partnerName,
-      contractPlan: session.contractPlan,
-      instruction: inst,
+    const slot: Prepared = {
+      inst,
+      created,
       orderIndex,
+      tracker: wrapRuntimeWithTracking(runtime),
+      isGlobal,
+    };
+    if (isGlobal) globals.push(slot);
+    else regulars.push(slot);
+  }
+
+  emit({
+    kind: "phase",
+    phase: "prepare",
+    regularCount: regulars.length,
+    globalCount: globals.length,
+  });
+
+  // ---- Phase 2A: 通常指示を並列実行 → 順次コミット ----
+  if (regulars.length > 0) {
+    emit({
+      kind: "phase",
+      phase: "regular",
+      regularCount: regulars.length,
+      globalCount: globals.length,
     });
-    const attachments = collectAttachments([inst]);
-
-    let agentResult: RunAgentOutput;
-    try {
-      agentResult = await deps.agentRunner.run({
-        systemInstruction: SYSTEM_INSTRUCTION,
-        userPrompt,
-        attachments,
-        sandbox: runtime,
-        cwd: deps.sandboxCwd,
-      });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      await deps.applications.update({
-        id: created.id,
-        status: "failed",
-        errorMessage: msg,
-        completedAt: new Date(),
-      });
-      const refreshed = await deps.applications.getById(created.id);
-      if (refreshed) results.push(refreshed);
-      // 1 件失敗したら後続を止める (状態の辻褄を保つため)
-      break;
+    const regularOutcomes = await Promise.all(
+      regulars.map((slot) => {
+        emit({
+          kind: "instruction",
+          instructionId: slot.inst.id,
+          status: "running",
+          isGlobal: false,
+        });
+        return runAgent(slot, {
+          systemInstruction: SYSTEM_INSTRUCTION_DEFAULT,
+          maxIterationsOverride: undefined,
+          deps,
+          session: activeSession,
+          emit,
+        });
+      }),
+    );
+    for (let i = 0; i < regulars.length; i++) {
+      const slot = regulars[i];
+      const outcome = regularOutcomes[i];
+      if (!slot || !outcome) continue;
+      const finalized = await commitAndFinalize(
+        slot,
+        outcome,
+        deps,
+        activeSession,
+        updateApp,
+      );
+      if (finalized) {
+        results.push(finalized);
+        emit({
+          kind: "instruction",
+          instructionId: slot.inst.id,
+          status: mapStatusToEventStatus(finalized.status),
+          isGlobal: false,
+          commitSha: finalized.commitSha ?? undefined,
+          message: finalized.errorMessage ?? finalized.summary ?? undefined,
+        });
+      }
     }
+  }
 
-    if (!agentResult.success) {
-      await deps.applications.update({
-        id: created.id,
-        status: "failed",
-        errorMessage: agentResult.errorMessage ?? agentResult.finalMessage,
-        summary: agentResult.finalMessage,
-        completedAt: new Date(),
-      });
-      const refreshed = await deps.applications.getById(created.id);
-      if (refreshed) results.push(refreshed);
-      break;
-    }
-
-    // commit
-    let commitSha: string | null;
-    try {
-      commitSha = await deps.committer.commitOnly({
-        sandboxId: session.sandboxId,
-        authorName: deps.botAuthorName,
-        authorEmail: deps.botAuthorEmail,
-        commitMessage: buildCommitMessage({
-          recordNumber: session.recordNumber,
-          instructionId: inst.id,
-          pinIndex: inst.pinIndex,
-          comment: inst.comment,
-          summary: agentResult.finalMessage,
-        }),
-      });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      await deps.applications.update({
-        id: created.id,
-        status: "failed",
-        errorMessage: `AI 修正は完了しましたが commit に失敗: ${msg}`,
-        summary: agentResult.finalMessage,
-        completedAt: new Date(),
-      });
-      const refreshed = await deps.applications.getById(created.id);
-      if (refreshed) results.push(refreshed);
-      break;
-    }
-
-    await deps.applications.update({
-      id: created.id,
-      status: "applied",
-      summary: agentResult.finalMessage,
-      commitSha,
-      completedAt: new Date(),
+  // ---- Phase 2B: 全体指示を 1 件ずつ順次実行 ----
+  // 通常指示の commit が全部終わってから、緩めた prompt + 大きな iteration 上限で回す。
+  if (globals.length > 0) {
+    emit({
+      kind: "phase",
+      phase: "global",
+      regularCount: regulars.length,
+      globalCount: globals.length,
     });
-    const refreshed = await deps.applications.getById(created.id);
-    if (refreshed) results.push(refreshed);
+    for (const slot of globals) {
+      emit({
+        kind: "instruction",
+        instructionId: slot.inst.id,
+        status: "running",
+        isGlobal: true,
+      });
+      const outcome = await runAgent(slot, {
+        systemInstruction: SYSTEM_INSTRUCTION_GLOBAL,
+        maxIterationsOverride: GLOBAL_MAX_ITERATIONS,
+        modelOverride: deps.globalModel,
+        deps,
+        session: activeSession,
+        emit,
+      });
+      const finalized = await commitAndFinalize(
+        slot,
+        outcome,
+        deps,
+        activeSession,
+        updateApp,
+      );
+      if (finalized) {
+        results.push(finalized);
+        emit({
+          kind: "instruction",
+          instructionId: slot.inst.id,
+          status: mapStatusToEventStatus(finalized.status),
+          isGlobal: true,
+          commitSha: finalized.commitSha ?? undefined,
+          message: finalized.errorMessage ?? finalized.summary ?? undefined,
+        });
+      }
+    }
   }
 
   const durationSec = (Date.now() - start) / 1000;
   const anyFailed = results.some((r) => r.status === "failed");
-  return NextResponse.json(
-    {
-      ok: !anyFailed,
-      message: buildResultMessage(results),
-      applications: results.map(toClientApplication),
-      durationSec,
-    },
-    { status: anyFailed ? 500 : 200 },
-  );
+  const clientApplications = results.map(toClientApplication);
+  const responseBody = {
+    ok: !anyFailed,
+    message: buildResultMessage(results),
+    applications: clientApplications,
+    durationSec,
+  };
+  emit({
+    kind: "phase",
+    phase: "complete",
+    regularCount: regulars.length,
+    globalCount: globals.length,
+  });
+  emit({
+    kind: "result",
+    ...responseBody,
+  });
+  return {
+    ok: !anyFailed,
+    status: anyFailed ? 500 : 200,
+    body: responseBody,
+  };
 }
 
-const SYSTEM_INSTRUCTION = `あなたはウェブディレクターのアシスタントです。
+function mapStatusToEventStatus(
+  s: InstructionApplication["status"],
+): "queued" | "running" | "applied" | "failed" | "reverted" | "unclear" {
+  if (s === "pending") return "queued";
+  return s;
+}
+
+// ---------------------------------------------------------------------------
+// agent 実行 / commit のヘルパ
+// ---------------------------------------------------------------------------
+type AgentOutcome =
+  | { kind: "success"; agentResult: RunAgentOutput }
+  | { kind: "agentFailed"; agentResult: RunAgentOutput }
+  | { kind: "runError"; error: unknown };
+
+interface AgentRunOptions {
+  systemInstruction: string;
+  maxIterationsOverride: number | undefined;
+  modelOverride?: string;
+  deps: CorrectionsControllerDependencies;
+  session: { recordNumber: string; partnerName: string; contractPlan: string };
+  emit: (event: CorrectionEvent) => void;
+}
+
+async function runAgent(
+  slot: {
+    inst: CorrectionInstructionInput;
+    orderIndex: number;
+    tracker: TrackingRuntime;
+    isGlobal: boolean;
+  },
+  opts: AgentRunOptions,
+): Promise<AgentOutcome> {
+  // 添付画像を sandbox に pre-upload し、Gemini が参照できる公開 URL を生成する。
+  // 失敗してもテキスト添付のマルチモーダル入力には支障しないので try/catch で握りつぶす。
+  let uploaded: UploadedAttachment[] = [];
+  try {
+    uploaded = await uploadInstructionAttachments(
+      slot.inst,
+      slot.tracker.runtime,
+    );
+  } catch (error) {
+    opts.emit({
+      kind: "log",
+      level: "warn",
+      message: `画像の sandbox への書き込みに失敗: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    });
+  }
+
+  const userPrompt = buildUserPromptSingle({
+    recordNumber: opts.session.recordNumber,
+    partnerName: opts.session.partnerName,
+    contractPlan: opts.session.contractPlan,
+    instruction: slot.inst,
+    orderIndex: slot.orderIndex,
+    isGlobal: slot.isGlobal,
+    uploaded,
+  });
+  const attachments = collectAttachments([slot.inst]);
+  try {
+    const agentResult = await opts.deps.agentRunner.run({
+      systemInstruction: opts.systemInstruction,
+      userPrompt,
+      attachments,
+      sandbox: slot.tracker.runtime,
+      cwd: opts.deps.sandboxCwd,
+      maxIterationsOverride: opts.maxIterationsOverride,
+      modelOverride: opts.modelOverride,
+      onToolCall: (event) => {
+        opts.emit({
+          kind: "toolCall",
+          instructionId: slot.inst.id,
+          name: event.name,
+          argsSummary: summarizeArgs(event.name, event.args),
+          success: event.result.success,
+          iteration: event.iteration,
+        });
+      },
+    });
+    return agentResult.success
+      ? { kind: "success", agentResult }
+      : { kind: "agentFailed", agentResult };
+  } catch (error) {
+    return { kind: "runError", error };
+  }
+}
+
+/**
+ * tool call 引数を 1 行の短い要約文字列に変換する。
+ * UI のログ表示で長大なコード内容を垂れ流さないため。
+ */
+function summarizeArgs(name: string, args: Record<string, unknown>): string {
+  const pick = (k: string): string => {
+    const v = args[k];
+    return typeof v === "string" ? v : "";
+  };
+  switch (name) {
+    case "read_file":
+    case "list_dir":
+    case "write_file":
+    case "edit_file":
+      return pick("path") || "(no path)";
+    case "glob":
+      return `${pick("pattern")}${pick("path") ? ` in ${pick("path")}` : ""}`;
+    case "grep":
+      return `/${pick("pattern")}/${pick("file_glob") ? ` glob=${pick("file_glob")}` : ""}`;
+    case "run_bash": {
+      const cmd = pick("command");
+      return cmd.length > 120 ? `${cmd.slice(0, 120)}…` : cmd;
+    }
+    default: {
+      const keys = Object.keys(args);
+      return keys.length > 0 ? `${keys[0]}=…` : "";
+    }
+  }
+}
+
+async function commitAndFinalize(
+  slot: {
+    inst: CorrectionInstructionInput;
+    created: InstructionApplication;
+    tracker: TrackingRuntime;
+  },
+  outcome: AgentOutcome,
+  deps: CorrectionsControllerDependencies,
+  session: { recordNumber: string; sandboxId: string },
+  updateApp: (
+    id: string,
+    patch: Partial<InstructionApplication>,
+  ) => InstructionApplication | null,
+): Promise<InstructionApplication | null> {
+  const { inst, created, tracker } = slot;
+  const now = () => new Date();
+
+  if (outcome.kind === "runError") {
+    const msg =
+      outcome.error instanceof Error
+        ? outcome.error.message
+        : String(outcome.error);
+    return updateApp(created.id, {
+      status: "failed",
+      errorMessage: msg,
+      completedAt: now(),
+    });
+  }
+
+  const agentResult = outcome.agentResult;
+
+  if (outcome.kind === "agentFailed") {
+    return updateApp(created.id, {
+      status: "failed",
+      errorMessage: agentResult.errorMessage ?? agentResult.finalMessage,
+      summary: agentResult.finalMessage,
+      completedAt: now(),
+    });
+  }
+
+  // run_bash が走った agent は tracker が touched path を把握できないので、
+  // pathSpec を指定せず全差分を対象にする。そうしないと sed/mv/cp 由来の
+  // 変更が commit に入らず "判定不可" で終わってしまう。
+  const touchedPaths = tracker.getTouchedPaths();
+  const usePathSpec = !tracker.hadRunCommand() && touchedPaths.length > 0;
+  let commitSha: string | null;
+  try {
+    commitSha = await deps.committer.commitOnly({
+      sandboxId: session.sandboxId,
+      authorName: deps.botAuthorName,
+      authorEmail: deps.botAuthorEmail,
+      commitMessage: buildCommitMessage({
+        recordNumber: session.recordNumber,
+        instructionId: inst.id,
+        pinIndex: inst.pinIndex,
+        comment: inst.comment,
+        summary: agentResult.finalMessage,
+      }),
+      pathSpec: usePathSpec ? touchedPaths : undefined,
+    });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return updateApp(created.id, {
+      status: "failed",
+      errorMessage: `AI 修正は完了しましたが commit に失敗: ${msg}`,
+      summary: agentResult.finalMessage,
+      completedAt: now(),
+    });
+  }
+
+  if (commitSha === null) {
+    return updateApp(created.id, {
+      status: "unclear",
+      summary: agentResult.finalMessage,
+      errorMessage:
+        "AI は変更すべき箇所を特定できませんでした。指示をもう少し具体的にするか、プレビュー上で対象要素を選択してから再送信してください。",
+      completedAt: now(),
+    });
+  }
+
+  return updateApp(created.id, {
+    status: "applied",
+    summary: agentResult.finalMessage,
+    commitSha,
+    completedAt: now(),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// agent 毎に書き込みパスを記録するラッパ
+// ---------------------------------------------------------------------------
+interface TrackingRuntime {
+  runtime: SandboxRuntime;
+  /**
+   * write_file / write_binary_file で触ったパス一覧。
+   * ただし run_bash が走った場合は「どのファイルを触ったか」を tracker が
+   * 知る術がない (sed, mv, cp, rm 等は直接 FS を変更する) ので、
+   * 代わりに {@link hadRunCommand} で「全差分を対象にすべき」シグナルを返す。
+   */
+  getTouchedPaths(): string[];
+  /**
+   * run_bash 由来の FS 変更があった可能性があるか。
+   * true の場合、commit 側では pathSpec を使わず `git add -A` で全差分を拾うべき。
+   */
+  hadRunCommand(): boolean;
+}
+
+function wrapRuntimeWithTracking(underlying: SandboxRuntime): TrackingRuntime {
+  const touched = new Set<string>();
+  let ranBash = false;
+  return {
+    runtime: {
+      readFile: (p) => underlying.readFile(p),
+      writeFile: async (p) => {
+        touched.add(p.path);
+        await underlying.writeFile(p);
+      },
+      writeBinaryFile: async (p) => {
+        touched.add(p.path);
+        await underlying.writeBinaryFile(p);
+      },
+      runCommand: async (p) => {
+        // sandboxTools 側で明示的に mutating: false と宣言された (list_dir / glob / grep)
+        // 場合は pathSpec を維持。それ以外は run_bash 由来と見なして全差分モード。
+        if (p.mutating !== false) ranBash = true;
+        return underlying.runCommand(p);
+      },
+    },
+    getTouchedPaths: () => Array.from(touched),
+    hadRunCommand: () => ranBash,
+  };
+}
+
+const SYSTEM_INSTRUCTION_DEFAULT = `あなたはウェブディレクターのアシスタントです。
 Vercel Sandbox 上に clone されたデモサイトのソースコードを、ディレクターの指示に従って編集してください。
 
 行動ルール:
@@ -246,12 +625,77 @@ Vercel Sandbox 上に clone されたデモサイトのソースコードを、�
 - まず必要なファイルを read_file / list_dir / glob / grep で確認してから編集する
 - 編集は edit_file (1 箇所置換) を優先し、丸ごと書き換える場合のみ write_file を使う
 - 添付画像がある場合は、ディレクターが「この画像を差し替えろ」「この画像のように配置しろ」等で使っている。文脈から判断する
-- 画像の bytes を Sandbox に直接コピーするツールは無いので、コード上の image 参照箇所を変更する程度にとどめる
-- この呼び出しでは **1 つの修正指示のみ** を処理する。複数の指示を受け取ったように見えても 1 件ずつ分けて呼ばれる
+- ディレクターから添付された画像は自動的に sandbox の public/directors-bot-uploads/<instructionId>/ 配下に配置済み。
+  具体的なファイルパスと公開 URL は「添付ファイル」セクションに列挙してあるので、そこに出ているものを信頼して参照すること。
+  コード上の src / href / url() / backgroundImage 等を、案内された公開 URL に置き換えて差し替えを実装する。
+  用途に応じて run_bash で mv / cp して別の場所へ再配置してもよい (その場合はコード側の参照パスも合わせて更新)。
+- この呼び出しでは **1 つの修正指示のみ** を処理する。複数の指示は独立した並列呼び出しで別 agent が担当するので、他の指示の存在は気にしない
 - 作業完了後、最後に短い日本語で「何をどう修正したか」のサマリを自由テキストで返して会話を終える
+- **どうしても変更箇所を特定できない場合**（指示が曖昧、対象の要素が見つからない、コードベースが想定と違う等）は、
+  無理に write_file / edit_file を実行せず、**ファイルを一切変更しないまま** 最終メッセージに
+  「なぜ特定できなかったか」と「ディレクターに何を補足してほしいか」を簡潔に日本語で説明して会話を終える。
+  推測で関係ない箇所を弄るのは絶対に避ける。
 `;
 
-async function parseBody(
+/**
+ * Anthropic 公式 frontend-design skill (Apache-2.0) を読み込む。
+ * 全体指示モード時のみ system prompt に連結され、デザイン品質ガードレールとして機能する。
+ * 詳細は skills/frontend-design/README.md 参照。
+ */
+const FRONTEND_DESIGN_SKILL = readFileSync(
+  join(process.cwd(), "skills", "frontend-design", "SKILL.md"),
+  "utf8",
+);
+
+/**
+ * 「全体指示」モード用の system prompt。
+ * 通常モードの「破壊的変更を避ける」「関係ない箇所は触らない」制約を緩め、
+ * サイト全体のデザイン・トーン変更を許可する。
+ * 並列実行は終わった後に単独で走るので、他 agent との衝突は考えなくて良い。
+ *
+ * frontend-design skill を強制参照として末尾に連結する。
+ */
+const SYSTEM_INSTRUCTION_GLOBAL = `あなたはウェブディレクターのアシスタントです。
+Vercel Sandbox 上に clone されたデモサイトのソースコードを、**サイト全体に渡る大きな変更** で書き換えてください。
+
+このリクエストは「全体指示」と呼ばれる特殊モードで、他の通常指示がすべて完了した後に単独で走ります。
+他の agent と FS を奪い合うことはないので、必要なら大胆に複数ファイルを横断的に編集して構いません。
+
+行動ルール:
+- サイト全体のトーン / デザイン / レイアウトの作り直しは許可される。フレームワーク変更だけは避ける。
+- まず list_dir / glob / grep / read_file で対象ファイル群を一通り把握してから編集計画を立てる
+- 編集は edit_file (1 箇所置換) を優先しつつ、必要なら write_file で大きく書き換えてもよい
+- 共通スタイル・色・フォント・余白などは tailwind config やグローバル CSS、共通レイアウトなど横断的な箇所を狙うと効率的
+- 添付画像がある場合は「このトーン / 配色 / 雰囲気を真似ろ」等の参考素材として扱う
+- ディレクターから添付された画像は自動的に sandbox の public/directors-bot-uploads/<instructionId>/ 配下に配置済み。
+  具体的なファイルパスと公開 URL は「添付ファイル」セクションに列挙してあるので、そこに出ているものを信頼して参照すること。
+  コード上の src / href / url() / backgroundImage 等を、案内された公開 URL に置き換えて差し替えを実装する。
+  用途に応じて run_bash で mv / cp して別の場所へ再配置してもよい (その場合はコード側の参照パスも合わせて更新)。
+- 複数ファイルを編集して構わないが、変更が複数の論理的話題を跨ぐ場合は無理に 1 回で全部やらず、
+  最も重要な見た目改善にフォーカスして、残りはサマリで「次の全体指示で扱うことを推奨」と言及する
+- 作業完了後、最後に日本語で「何をどう変更したか (どのファイル群をどの方向に書き換えたか)」のサマリを返して会話を終える
+- **どうしても方針が立たない場合**（指示が抽象的すぎる、参考が無い等）は、
+  無理に編集を行わず、**ファイルを一切変更しないまま** 最終メッセージに
+  「なぜ着手できなかったか」と「ディレクターに何を補足してほしいか」を簡潔に説明して会話を終える。
+
+---
+
+# 【必須】デザイン判断の基準: frontend-design skill
+
+以下は Anthropic 公式 frontend-design skill (Apache-2.0) の原文。
+**全体指示モードでは、このガイドラインを必ず参照して美的方向性を決定すること。**
+「generic AI aesthetics を避ける」「BOLD な方向に振り切る」「Inter / Roboto / Arial / purple-on-white
+等の手癖を避ける」などの禁則は厳密に守ること。コミットメッセージやサマリでは、
+skill のどの原則に従ったか (例: Typography を見直し / Color を dominant+sharp accent に再構築 / 等)
+を 1 文含めること。
+
+${FRONTEND_DESIGN_SKILL}
+`;
+
+/** 全体指示モードの最大反復回数 (通常の約 2.5 倍を想定)。 */
+const GLOBAL_MAX_ITERATIONS = 300;
+
+export async function parseCorrectionsBody(
   request: Request,
 ): Promise<ParsedBody | { error: string }> {
   let payload: unknown;
@@ -274,6 +718,7 @@ async function parseBody(
     const comment = typeof raw.comment === "string" ? raw.comment : "";
     // pin は UI から廃止済みだが DB 互換のため null を保持
     const pinIndex = typeof raw.pinIndex === "number" ? raw.pinIndex : null;
+    const isGlobal = raw.isGlobal === true;
     if (!id || !comment) return { error: "id と comment は必須です。" };
 
     const attachments: CorrectionInstructionInput["attachments"] = [];
@@ -306,12 +751,59 @@ async function parseBody(
       }
     }
 
-    instructions.push({ id, comment, pinIndex, attachments, selectors });
+    instructions.push({ id, comment, pinIndex, isGlobal, attachments, selectors });
   }
   if (instructions.length === 0) {
     return { error: "修正指示が 1 件もありません。" };
   }
   return { sessionId, instructions };
+}
+
+interface UploadedAttachment {
+  originalFilename: string;
+  mimeType: string;
+  /** sandbox FS 上のパス (working dir からの相対) */
+  sandboxPath: string;
+  /** Next.js demo サイト上で配信される公開 URL (/public を剥がしたもの) */
+  publicUrl: string;
+  sizeBytes: number;
+}
+
+/** Next.js public/ 配下に添付画像を配置してコード参照できるようにする。 */
+const UPLOAD_PUBLIC_ROOT = "public/directors-bot-uploads";
+
+async function uploadInstructionAttachments(
+  inst: CorrectionInstructionInput,
+  runtime: SandboxRuntime,
+): Promise<UploadedAttachment[]> {
+  const atts = inst.attachments ?? [];
+  if (atts.length === 0) return [];
+  // 個々の upload は相互に独立なので並列化。画像 N 枚 = N RTT → 1 RTT相当に短縮。
+  return Promise.all(
+    atts.map(async (att, i) => {
+      const safeName = sanitizeUploadFilename(att.filename);
+      const rel = `${UPLOAD_PUBLIC_ROOT}/${inst.id}/${String(i).padStart(2, "0")}-${safeName}`;
+      const buf = Buffer.from(att.base64, "base64");
+      await runtime.writeBinaryFile({ path: rel, content: buf });
+      return {
+        originalFilename: att.filename,
+        mimeType: att.mimeType,
+        sandboxPath: rel,
+        publicUrl: `/${rel.replace(/^public\//, "")}`,
+        sizeBytes: buf.byteLength,
+      };
+    }),
+  );
+}
+
+function sanitizeUploadFilename(name: string): string {
+  // パス区切り・NULL・制御文字・スペース・バックスラッシュを除去し、80 文字に丸める。
+  const trimmed = name
+    .replace(/[/\\\x00-\x1f]+/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/_+/g, "_");
+  const truncated = trimmed.length > 80 ? trimmed.slice(-80) : trimmed;
+  return truncated || "file";
 }
 
 function collectAttachments(
@@ -337,7 +829,12 @@ function buildUserPromptSingle(params: {
   contractPlan: string;
   instruction: CorrectionInstructionInput;
   orderIndex: number;
+  isGlobal: boolean;
+  uploaded: readonly UploadedAttachment[];
 }): string {
+  const heading = params.isGlobal
+    ? `## 全体指示 (第 ${params.orderIndex + 1} 件目, id=${params.instruction.id})`
+    : `## 修正指示 (第 ${params.orderIndex + 1} 件目, id=${params.instruction.id})`;
   const lines: string[] = [
     `# デモサイト修正タスク`,
     ``,
@@ -345,11 +842,17 @@ function buildUserPromptSingle(params: {
     `パートナー名: ${params.partnerName}`,
     `契約プラン: ${params.contractPlan}`,
     ``,
-    `## 修正指示 (第 ${params.orderIndex + 1} 件目, id=${params.instruction.id})`,
+    heading,
     ``,
     params.instruction.comment,
     ``,
   ];
+  if (params.isGlobal) {
+    lines.push(
+      `※ これは「全体指示」モード。サイト全体に渡る大胆な編集が許可されている。`,
+    );
+    lines.push(``);
+  }
   if (params.instruction.selectors && params.instruction.selectors.length > 0) {
     lines.push(`### ディレクターが指定した対象 DOM 要素`);
     lines.push(
@@ -364,8 +867,25 @@ function buildUserPromptSingle(params: {
     }
     lines.push(``);
   }
-  if (params.instruction.attachments && params.instruction.attachments.length > 0) {
-    lines.push(`添付ファイル:`);
+  if (params.uploaded.length > 0) {
+    lines.push(`### 添付ファイル (sandbox に配置済み)`);
+    lines.push(
+      `以下のパス / 公開 URL で既に FS に書き込まれている。差し替え先としてそのまま使える。`,
+    );
+    for (const u of params.uploaded) {
+      lines.push(``);
+      lines.push(
+        `- 元ファイル名: \`${u.originalFilename}\` (${u.mimeType}, ${u.sizeBytes} bytes)`,
+      );
+      lines.push(`  - sandbox FS パス: \`${u.sandboxPath}\``);
+      lines.push(`  - 公開 URL: \`${u.publicUrl}\``);
+    }
+    lines.push(``);
+  } else if (
+    params.instruction.attachments &&
+    params.instruction.attachments.length > 0
+  ) {
+    lines.push(`添付ファイル (メタ情報のみ / FS 書き込みには失敗しています):`);
     for (const a of params.instruction.attachments) {
       lines.push(`- ${a.filename} (${a.mimeType})`);
     }
@@ -392,13 +912,21 @@ function buildCommitMessage(params: {
 function buildResultMessage(results: readonly InstructionApplication[]): string {
   const applied = results.filter((r) => r.status === "applied").length;
   const failed = results.filter((r) => r.status === "failed").length;
-  if (failed > 0) {
-    return `${applied} 件の修正を適用しました。${failed} 件で失敗したため以降の指示はスキップされています。`;
+  const unclear = results.filter((r) => r.status === "unclear").length;
+  const parts: string[] = [];
+  if (applied > 0) parts.push(`${applied} 件適用`);
+  if (unclear > 0) parts.push(`${unclear} 件は判定不可 (変更箇所を特定できず)`);
+  if (failed > 0) parts.push(`${failed} 件で失敗`);
+  if (applied === 0 && unclear === 0 && failed === 0) {
+    return `すべての指示は既に処理済みでした。`;
   }
-  if (applied === 0) {
-    return `すべての指示は既に適用済みでした。`;
+  if (applied === 0 && failed === 0) {
+    return `${unclear} 件のすべてで AI は変更箇所を特定できませんでした。指示をより具体的にして再送信してください。`;
   }
-  return `${applied} 件の修正を Sandbox に適用しました。確認のうえ「そのまま変更する」で GitHub に保存してください。`;
+  if (failed > 0 && applied === 0) {
+    return `${parts.join(" / ")}。`;
+  }
+  return `${parts.join(" / ")}。確認のうえ「変更を保存する」で GitHub に保存してください。`;
 }
 
 export function toClientApplication(app: InstructionApplication) {
@@ -408,6 +936,7 @@ export function toClientApplication(app: InstructionApplication) {
     comment: app.comment,
     pinIndex: app.pinIndex,
     orderIndex: app.orderIndex,
+    isGlobal: app.isGlobal,
     status: app.status,
     summary: app.summary,
     errorMessage: app.errorMessage,

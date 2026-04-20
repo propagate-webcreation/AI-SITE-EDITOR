@@ -10,8 +10,3 @@ export {
   SessionAlreadyActiveError,
 } from "./sessionRepositoryPort";
 export type { SessionRepositoryPort } from "./sessionRepositoryPort";
-export type {
-  CreateInstructionApplicationInput,
-  InstructionApplicationRepositoryPort,
-  UpdateInstructionApplicationInput,
-} from "./instructionApplicationRepositoryPort";

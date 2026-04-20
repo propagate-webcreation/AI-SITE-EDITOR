@@ -3,55 +3,8 @@ import {
   handleCorrectionsRequest,
   type CorrectionsControllerDependencies,
 } from "./correctionsController";
-import type {
-  InstructionApplicationRepositoryPort,
-  SessionRepositoryPort,
-} from "@/domain/ports";
-import type { InstructionApplication, Session } from "@/domain/models";
-
-function sampleSession(overrides: Partial<Session> = {}): Session {
-  return {
-    id: "sess-1",
-    directorId: "dir-A",
-    recordNumber: "001",
-    partnerName: "Feminique",
-    contractPlan: "BASIC",
-    sandboxId: "sbx_1",
-    previewUrl: "https://preview.run",
-    githubRepoUrl: "https://github.com/x/y",
-    status: "active",
-    startedAt: new Date(),
-    expiresAt: new Date(Date.now() + 3600_000),
-    ...overrides,
-  };
-}
-
-function sampleApp(
-  overrides: Partial<InstructionApplication> = {},
-): InstructionApplication {
-  return {
-    id: "app-1",
-    sessionId: "sess-1",
-    instructionId: "ins-1",
-    comment: "修正してください",
-    pinIndex: null,
-    attachments: [],
-    orderIndex: 0,
-    status: "pending",
-    summary: null,
-    errorMessage: null,
-    commitSha: null,
-    revertCommitSha: null,
-    startedAt: null,
-    completedAt: null,
-    revertedAt: null,
-    createdAt: new Date(),
-    ...overrides,
-  };
-}
 
 function makeDeps(params: {
-  session?: Session | null;
   agentResults?: Array<{
     success: boolean;
     finalMessage: string;
@@ -60,64 +13,15 @@ function makeDeps(params: {
     iterations?: number;
   }>;
   commitResults?: Array<string | null | Error>;
-  directorId?: string;
 } = {}): {
   deps: CorrectionsControllerDependencies;
-  applicationsState: Map<string, InstructionApplication>;
 } {
-  const sessions: SessionRepositoryPort = {
-    create: vi.fn(),
-    getById: vi.fn().mockResolvedValue(
-      params.session === undefined ? sampleSession() : params.session,
-    ),
-    getActiveByRecordNumber: vi.fn(),
-    listActiveByDirector: vi.fn(),
-    updateStatus: vi.fn(),
-    getDirectorEmail: vi.fn().mockResolvedValue(null),
-  };
-
-  const state = new Map<string, InstructionApplication>();
-  let nextId = 1;
-  const applications: InstructionApplicationRepositoryPort = {
-    create: vi.fn().mockImplementation(async (input) => {
-      const app = sampleApp({
-        id: `app-${nextId++}`,
-        sessionId: input.sessionId,
-        instructionId: input.instructionId,
-        comment: input.comment,
-        pinIndex: input.pinIndex,
-        attachments: input.attachments,
-        orderIndex: input.orderIndex,
-        status: "pending",
-      });
-      state.set(app.id, app);
-      return app;
-    }),
-    nextOrderIndex: vi.fn().mockImplementation(async () => state.size),
-    getById: vi.fn().mockImplementation(async (id: string) => state.get(id) ?? null),
-    getBySessionAndInstructionId: vi.fn().mockResolvedValue(null),
-    listBySession: vi.fn().mockImplementation(async () => Array.from(state.values())),
-    update: vi.fn().mockImplementation(async (input) => {
-      const app = state.get(input.id);
-      if (!app) return;
-      state.set(input.id, {
-        ...app,
-        status: input.status ?? app.status,
-        summary: input.summary ?? app.summary,
-        errorMessage: input.errorMessage ?? app.errorMessage,
-        commitSha: input.commitSha ?? app.commitSha,
-        revertCommitSha: input.revertCommitSha ?? app.revertCommitSha,
-        startedAt: input.startedAt ?? app.startedAt,
-        completedAt: input.completedAt ?? app.completedAt,
-        revertedAt: input.revertedAt ?? app.revertedAt,
-      });
-    }),
-  };
 
   const runtimeProvider = {
     getRuntime: vi.fn().mockResolvedValue({
       readFile: vi.fn(),
       writeFile: vi.fn(),
+      writeBinaryFile: vi.fn(),
       runCommand: vi.fn(),
     }),
   };
@@ -146,34 +50,61 @@ function makeDeps(params: {
 
   return {
     deps: {
-      sessions,
-      applications,
       runtimeProvider,
       agentRunner,
       committer,
-      directorId: params.directorId ?? "dir-A",
       sandboxCwd: "/vercel/sandbox",
       botAuthorName: "bot",
       botAuthorEmail: "bot@example.com",
     },
-    applicationsState: state,
   };
 }
 
-function makeRequest(body: unknown): Request {
-  return new Request("http://localhost/api/corrections", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+interface CorrectionInput {
+  session?: {
+    id: string;
+    sandboxId: string;
+    recordNumber: string;
+    partnerName: string;
+    contractPlan: string;
+  };
+  instructions: Array<{
+    id: string;
+    comment: string;
+    pinIndex: number | null;
+    isGlobal?: boolean;
+    attachments?: Array<{ filename: string; mimeType: string; base64: string }>;
+    selectors?: Array<{ tag: string; selector: string; text: string; html: string }>;
+  }>;
 }
 
-describe("handleCorrectionsRequest (逐次実行)", () => {
-  it("2 件の指示を順に処理し、各件 commit する", async () => {
+function makeInput(body: CorrectionInput): {
+  session: {
+    id: string;
+    sandboxId: string;
+    recordNumber: string;
+    partnerName: string;
+    contractPlan: string;
+  };
+  instructions: CorrectionInput["instructions"];
+} {
+  return {
+    session: body.session ?? {
+      id: "sess-1",
+      sandboxId: "sbx_1",
+      recordNumber: "001",
+      partnerName: "Feminique",
+      contractPlan: "BASIC",
+    },
+    instructions: body.instructions,
+  };
+}
+
+describe("handleCorrectionsRequest (並列実行)", () => {
+  it("2 件の指示を並列で処理し、各件 commit する", async () => {
     const { deps } = makeDeps();
     const res = await handleCorrectionsRequest(
-      makeRequest({
-        sessionId: "sess-1",
+      makeInput({
         instructions: [
           { id: "ins-1", comment: "A を修正", pinIndex: 0 },
           { id: "ins-2", comment: "B を修正", pinIndex: null },
@@ -182,18 +113,14 @@ describe("handleCorrectionsRequest (逐次実行)", () => {
       deps,
     );
     expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      ok: boolean;
-      applications: Array<{ status: string; commitSha: string | null }>;
-    };
-    expect(body.ok).toBe(true);
-    expect(body.applications.length).toBe(2);
-    expect(body.applications.every((a) => a.status === "applied")).toBe(true);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.applications.length).toBe(2);
+    expect(res.body.applications.every((a) => a.status === "applied")).toBe(true);
     expect(deps.agentRunner.run).toHaveBeenCalledTimes(2);
     expect(deps.committer.commitOnly).toHaveBeenCalledTimes(2);
   });
 
-  it("途中の指示が失敗したら後続を停止", async () => {
+  it("1 件失敗しても他は独立に完了する (並列なので fail-fast しない)", async () => {
     const { deps } = makeDeps({
       agentResults: [
         { success: true, finalMessage: "ok 1" },
@@ -202,8 +129,7 @@ describe("handleCorrectionsRequest (逐次実行)", () => {
       ],
     });
     const res = await handleCorrectionsRequest(
-      makeRequest({
-        sessionId: "sess-1",
+      makeInput({
         instructions: [
           { id: "i1", comment: "A", pinIndex: 0 },
           { id: "i2", comment: "B", pinIndex: 0 },
@@ -213,84 +139,155 @@ describe("handleCorrectionsRequest (逐次実行)", () => {
       deps,
     );
     expect(res.status).toBe(500);
-    const body = (await res.json()) as {
-      ok: boolean;
-      applications: Array<{ instructionId: string; status: string }>;
-    };
-    expect(body.ok).toBe(false);
-    expect(body.applications.length).toBe(2); // 3 件目は実行されない
-    expect(body.applications[0]?.status).toBe("applied");
-    expect(body.applications[1]?.status).toBe("failed");
-    expect(deps.agentRunner.run).toHaveBeenCalledTimes(2);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.applications.length).toBe(3);
+    expect(res.body.applications[0]?.status).toBe("applied");
+    expect(res.body.applications[1]?.status).toBe("failed");
+    expect(res.body.applications[2]?.status).toBe("applied");
+    expect(deps.agentRunner.run).toHaveBeenCalledTimes(3);
   });
 
-  it("既に適用済みの指示はスキップ (idempotent)", async () => {
+  it("isGlobal=true の指示は他の通常指示が完了してから単独で実行される", async () => {
+    const callOrder: string[] = [];
     const { deps } = makeDeps();
-    (deps.applications.getBySessionAndInstructionId as ReturnType<typeof vi.fn>)
-      .mockResolvedValueOnce(sampleApp({ instructionId: "ins-1", status: "applied" }))
-      .mockResolvedValue(null);
+    (deps.agentRunner.run as ReturnType<typeof vi.fn>).mockImplementation(
+      async (input) => {
+        const tag = input.userPrompt.includes("ins-global")
+          ? "global"
+          : input.userPrompt.includes("ins-1")
+            ? "n1"
+            : "n2";
+        callOrder.push(`start:${tag}`);
+        await new Promise((r) => setTimeout(r, 20));
+        callOrder.push(`end:${tag}`);
+        return {
+          success: true,
+          finalMessage: `done ${tag}`,
+          toolUseCount: 1,
+          iterations: 1,
+        };
+      },
+    );
+
     const res = await handleCorrectionsRequest(
-      makeRequest({
-        sessionId: "sess-1",
+      makeInput({
         instructions: [
-          { id: "ins-1", comment: "already", pinIndex: 0 },
-          { id: "ins-2", comment: "new", pinIndex: 0 },
+          { id: "ins-1", comment: "通常 1", pinIndex: 0 },
+          { id: "ins-2", comment: "通常 2", pinIndex: 0 },
+          { id: "ins-global", comment: "全体トーン変更", pinIndex: 0, isGlobal: true },
         ],
       }),
       deps,
     );
     expect(res.status).toBe(200);
-    // ins-1 は skip、ins-2 だけ agent 実行
-    expect(deps.agentRunner.run).toHaveBeenCalledTimes(1);
+
+    // 通常 2 件は並列、global は 通常 2 件の end の後に始まる
+    const globalStartIdx = callOrder.indexOf("start:global");
+    const n1EndIdx = callOrder.indexOf("end:n1");
+    const n2EndIdx = callOrder.indexOf("end:n2");
+    expect(globalStartIdx).toBeGreaterThan(n1EndIdx);
+    expect(globalStartIdx).toBeGreaterThan(n2EndIdx);
   });
 
-  it("セッション無しなら 404", async () => {
-    const { deps } = makeDeps({ session: null });
-    const res = await handleCorrectionsRequest(
-      makeRequest({
-        sessionId: "sess-1",
-        instructions: [{ id: "a", comment: "x", pinIndex: 0 }],
-      }),
-      deps,
-    );
-    expect(res.status).toBe(404);
-  });
-
-  it("別ディレクターなら 403", async () => {
-    const { deps } = makeDeps({
-      session: sampleSession({ directorId: "dir-B" }),
-      directorId: "dir-A",
-    });
-    const res = await handleCorrectionsRequest(
-      makeRequest({
-        sessionId: "sess-1",
-        instructions: [{ id: "a", comment: "x", pinIndex: 0 }],
-      }),
-      deps,
-    );
-    expect(res.status).toBe(403);
-  });
-
-  it("closed セッションなら 410", async () => {
-    const { deps } = makeDeps({
-      session: sampleSession({ status: "closed" }),
-    });
-    const res = await handleCorrectionsRequest(
-      makeRequest({
-        sessionId: "sess-1",
-        instructions: [{ id: "a", comment: "x", pinIndex: 0 }],
-      }),
-      deps,
-    );
-    expect(res.status).toBe(410);
-  });
-
-  it("instructions 空なら 400", async () => {
+  it("並列: agent 呼び出しは同時に走りはじめる", async () => {
+    let concurrent = 0;
+    let maxConcurrent = 0;
     const { deps } = makeDeps();
-    const res = await handleCorrectionsRequest(
-      makeRequest({ sessionId: "sess-1", instructions: [] }),
+    (deps.agentRunner.run as ReturnType<typeof vi.fn>).mockImplementation(
+      async () => {
+        concurrent += 1;
+        maxConcurrent = Math.max(maxConcurrent, concurrent);
+        await new Promise((r) => setTimeout(r, 10));
+        concurrent -= 1;
+        return {
+          success: true,
+          finalMessage: "ok",
+          toolUseCount: 1,
+          iterations: 1,
+        };
+      },
+    );
+    await handleCorrectionsRequest(
+      makeInput({
+        instructions: [
+          { id: "i1", comment: "A", pinIndex: 0 },
+          { id: "i2", comment: "B", pinIndex: 0 },
+          { id: "i3", comment: "C", pinIndex: 0 },
+        ],
+      }),
       deps,
     );
-    expect(res.status).toBe(400);
+    expect(maxConcurrent).toBeGreaterThanOrEqual(2);
+  });
+
+  it("run_bash (mutating) が走ったら pathSpec を使わず全差分コミットに切替", async () => {
+    const { deps } = makeDeps();
+    (deps.runtimeProvider.getRuntime as ReturnType<typeof vi.fn>).mockResolvedValue({
+      readFile: vi.fn(),
+      writeFile: vi.fn(),
+      writeBinaryFile: vi.fn(),
+      runCommand: vi.fn().mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 }),
+    });
+    (deps.agentRunner.run as ReturnType<typeof vi.fn>).mockImplementation(
+      async (input) => {
+        // run_bash は mutating: undefined (= mutating 扱い) を渡す
+        await input.sandbox.runCommand({
+          cmd: "bash",
+          args: ["-lc", "sed -i s/a/b/ x"],
+        });
+        return {
+          success: true,
+          finalMessage: "sed で書き換え",
+          toolUseCount: 1,
+          iterations: 1,
+        };
+      },
+    );
+    await handleCorrectionsRequest(
+      makeInput({
+        instructions: [{ id: "i1", comment: "sedで書き換えて", pinIndex: 0 }],
+      }),
+      deps,
+    );
+    const commitCallArgs = (deps.committer.commitOnly as ReturnType<typeof vi.fn>)
+      .mock.calls[0]?.[0];
+    expect(commitCallArgs?.pathSpec).toBeUndefined();
+  });
+
+  it("read-only bash (mutating=false) だけなら writeFile 由来の pathSpec を維持", async () => {
+    const { deps } = makeDeps();
+    (deps.runtimeProvider.getRuntime as ReturnType<typeof vi.fn>).mockResolvedValue({
+      readFile: vi.fn(),
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      writeBinaryFile: vi.fn(),
+      runCommand: vi.fn().mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 }),
+    });
+    (deps.agentRunner.run as ReturnType<typeof vi.fn>).mockImplementation(
+      async (input) => {
+        // list_dir 相当 (mutating: false)
+        await input.sandbox.runCommand({
+          cmd: "bash",
+          args: ["-lc", "ls -1"],
+          mutating: false,
+        });
+        // edit_file 相当 (writeFile 経由で tracker に載る)
+        await input.sandbox.writeFile({ path: "app/page.tsx", content: "..." });
+        return {
+          success: true,
+          finalMessage: "edit",
+          toolUseCount: 2,
+          iterations: 1,
+        };
+      },
+    );
+    await handleCorrectionsRequest(
+      makeInput({
+        instructions: [{ id: "i1", comment: "page.tsx修正", pinIndex: 0 }],
+      }),
+      deps,
+    );
+    const commitCallArgs = (deps.committer.commitOnly as ReturnType<typeof vi.fn>)
+      .mock.calls[0]?.[0];
+    expect(commitCallArgs?.pathSpec).toEqual(["app/page.tsx"]);
   });
 });

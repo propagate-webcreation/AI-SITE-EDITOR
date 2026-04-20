@@ -30,6 +30,11 @@ export interface SandboxInfo {
 }
 
 const DEFAULT_CWD = "/vercel/sandbox";
+// push 直前の skills/ クリーンアップ commit に使う author。通常は
+// correctionsController 側の bot 名義で commit されているが、この最終クリーンアップは
+// manager 内で自己完結させるためフォールバック名義を持つ。
+const BOT_NAME_FALLBACK = "propagate-bot";
+const BOT_EMAIL_FALLBACK = "bot@propagateinc.com";
 
 /**
  * Vercel Sandbox を 1 つ起動し、デモサイトを clone + npm install + dev server まで用意する。
@@ -107,6 +112,104 @@ export class VercelSandboxManager {
   }
 
   /**
+   * Sandbox 内の git log から `directors-bot: <recordNumber> <instructionId>` 形式の
+   * 修正コミットを列挙する。案件を閉じずにタブ/セッションが切れたとき、
+   * client 側で localStorage の submitted 状態を applied に昇格させるために使う。
+   *
+   * revert コミット (`revert directors-bot: ...`) も返す。client 側で revert 判定に使う。
+   *
+   * hasDirty は `git status --porcelain` で検出。途中中断した修正作業の痕跡チェック。
+   */
+  async listDirectorCommits(sandboxId: string): Promise<{
+    commits: {
+      sha: string;
+      instructionId: string;
+      recordNumber: string;
+      kind: "apply" | "revert";
+      targetSha?: string;
+      committedAt: number;
+      bodyFirstLine: string;
+    }[];
+    hasDirty: boolean;
+  }> {
+    const sandbox = await Sandbox.get({ ...this.credsArg(), sandboxId });
+
+    const LOG_DELIM = "\x1fEND_COMMIT\x1f";
+    const shellCmd = [
+      `cd ${DEFAULT_CWD}`,
+      // `%H` sha / `%ct` commit time (epoch) / `%B` body
+      `git log --grep='^\\(revert \\)\\?directors-bot: ' --extended-regexp ` +
+        `--format='%H%x1f%ct%x1f%B${LOG_DELIM}'`,
+      `echo "==STATUS=="`,
+      `git status --porcelain`,
+    ].join(" && ");
+
+    const res = await runAndCaptureStdout(sandbox, {
+      cmd: "bash",
+      args: ["-lc", shellCmd],
+      timeoutMs: 60_000,
+    });
+    if (res.exitCode !== 0) {
+      throw new Error(
+        `git log / status に失敗 (exit=${res.exitCode})\nstderr: ${res.stderr.slice(0, 800)}`,
+      );
+    }
+
+    const [logPart = "", statusPart = ""] = res.stdout.split("==STATUS==");
+    const hasDirty = statusPart.trim().length > 0;
+
+    const commits: Awaited<
+      ReturnType<VercelSandboxManager["listDirectorCommits"]>
+    >["commits"] = [];
+    for (const chunk of logPart.split(LOG_DELIM)) {
+      const entry = chunk.trim();
+      if (!entry) continue;
+      const parts = entry.split("\x1f");
+      if (parts.length < 3) continue;
+      const sha = (parts[0] ?? "").trim();
+      const ctStr = (parts[1] ?? "").trim();
+      const body = (parts.slice(2).join("\x1f") ?? "").trim();
+      if (!sha) continue;
+
+      const firstLine = body.split("\n")[0] ?? "";
+      const applyMatch = firstLine.match(
+        /^directors-bot:\s+(\S+)\s+(\S+)/,
+      );
+      const revertMatch = firstLine.match(
+        /^revert directors-bot:\s+(\S+)\s+(\S+)/,
+      );
+      const bodyLines = body.split("\n");
+      const targetShaMatch = bodyLines
+        .join("\n")
+        .match(/rollback of ([a-f0-9]{7,40})/);
+      const committedAt = Number.parseInt(ctStr, 10) * 1000;
+
+      if (revertMatch) {
+        commits.push({
+          sha,
+          recordNumber: revertMatch[1] ?? "",
+          instructionId: revertMatch[2] ?? "",
+          kind: "revert",
+          targetSha: targetShaMatch?.[1],
+          committedAt: Number.isFinite(committedAt) ? committedAt : Date.now(),
+          bodyFirstLine: firstLine,
+        });
+      } else if (applyMatch) {
+        commits.push({
+          sha,
+          recordNumber: applyMatch[1] ?? "",
+          instructionId: applyMatch[2] ?? "",
+          kind: "apply",
+          committedAt: Number.isFinite(committedAt) ? committedAt : Date.now(),
+          bodyFirstLine: firstLine,
+        });
+      }
+    }
+
+    return { commits, hasDirty };
+  }
+
+  /**
    * Sandbox 内で git add + commit を実行し、作成された commit SHA を返す。
    * 変更が無ければ null (= nothing to commit)。push は別メソッド。
    */
@@ -115,15 +218,29 @@ export class VercelSandboxManager {
     authorName: string;
     authorEmail: string;
     commitMessage: string;
+    /**
+     * 指定された場合、このパス (または glob) のみを `git add` 対象にする。
+     * 並列 Gemini 実行で、各 agent が触ったファイルだけを自分の commit に含めるために使う。
+     * 省略時は `-A` (全差分)。
+     */
+    pathSpec?: readonly string[];
   }): Promise<string | null> {
     const sandbox = await Sandbox.get({
       ...this.credsArg(),
       sandboxId: params.sandboxId,
     });
 
+    const hasPathSpec = !!params.pathSpec && params.pathSpec.length > 0;
+    const pathArg = hasPathSpec
+      ? params.pathSpec!.map((p) => shellQuote(p)).join(" ")
+      : "";
+
+    const statusCmd = hasPathSpec
+      ? `git status --porcelain -- ${pathArg}`
+      : `git status --porcelain`;
     const statusRes = await runAndCaptureStdout(sandbox, {
       cmd: "bash",
-      args: ["-lc", `cd ${DEFAULT_CWD} && git status --porcelain`],
+      args: ["-lc", `cd ${DEFAULT_CWD} && ${statusCmd}`],
       timeoutMs: 60_000,
     });
     if (statusRes.exitCode !== 0) {
@@ -135,11 +252,13 @@ export class VercelSandboxManager {
       return null;
     }
 
+    const addCmd = hasPathSpec ? `git add -- ${pathArg}` : `git add -A`;
     const shellCmd = [
       `cd ${DEFAULT_CWD}`,
       `git config user.name ${shellQuote(params.authorName)}`,
       `git config user.email ${shellQuote(params.authorEmail)}`,
-      `git add -A`,
+      addCmd,
+      `git diff --cached --quiet && exit 65 || true`,
       `git commit -m ${shellQuote(params.commitMessage)}`,
       `git rev-parse HEAD`,
     ].join(" && ");
@@ -149,6 +268,8 @@ export class VercelSandboxManager {
       args: ["-lc", shellCmd],
       timeoutMs: 60_000,
     });
+    // 65 = 並列 agent の別 commit で既に取り込まれており、このインスタンスの分は差分ゼロだった
+    if (res.exitCode === 65) return null;
     if (res.exitCode !== 0) {
       throw new Error(
         `git commit が失敗しました (exit=${res.exitCode})\nstderr: ${res.stderr.slice(0, 1200)}`,
@@ -224,8 +345,18 @@ export class VercelSandboxManager {
       params.repoUrl,
       params.githubToken,
     );
+    // Gemini が system prompt の skill 参照に引きずられて誤って skills/ を
+    // demo 側に作成してしまった場合に備えて、push 前に必ずクリーンアップする。
+    // 何も存在しなければ no-op (rm -rf は冪等、git diff で差分無しなら commit skip)。
     const shellCmd = [
       `cd ${DEFAULT_CWD}`,
+      `rm -rf skills`,
+      `git rm -rf --cached --ignore-unmatch skills > /dev/null 2>&1 || true`,
+      `if ! git diff --cached --quiet; then ` +
+        `git -c user.name=${shellQuote(BOT_NAME_FALLBACK)} ` +
+        `-c user.email=${shellQuote(BOT_EMAIL_FALLBACK)} ` +
+        `commit -m "internal: drop skills/ before push"; ` +
+        `fi`,
       `git push --force ${shellQuote(authedUrl)} HEAD:${shellQuote(params.branch)}`,
       `git rev-parse HEAD`,
     ].join(" && ");
@@ -280,7 +411,28 @@ class VercelSandboxRuntime implements SandboxRuntime {
 
   async writeFile(params: { path: string; content: string }): Promise<void> {
     await this.sandbox.writeFiles([
-      { path: params.path, content: params.content },
+      { path: params.path, content: Buffer.from(params.content, "utf8") },
+    ]);
+  }
+
+  async writeBinaryFile(params: {
+    path: string;
+    content: Buffer;
+  }): Promise<void> {
+    // 相対パスは sandbox working dir 基準に正規化
+    const absPath = params.path.startsWith("/")
+      ? params.path
+      : `${DEFAULT_CWD}/${params.path}`;
+    // ネストしたディレクトリを先に作成 (writeFiles は親 dir 自動作成を保証しない)
+    const dir = absPath.replace(/\/[^/]+$/, "");
+    if (dir && dir !== absPath) {
+      await this.sandbox.runCommand({
+        cmd: "mkdir",
+        args: ["-p", dir],
+      });
+    }
+    await this.sandbox.writeFiles([
+      { path: absPath, content: params.content },
     ]);
   }
 

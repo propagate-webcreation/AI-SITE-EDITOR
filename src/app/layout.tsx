@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "directors-bot-v1 | デモサイト修正アプリ",
+  title: "AI-SITE-EDITOR | デモサイト修正アプリ",
   description: "ディレクターがデモサイトをチェック・修正するためのアプリ",
 };
 
@@ -27,7 +27,7 @@ export default function RootLayout({
       lang="ja"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-neutral-950 text-neutral-100">
+      <body className="min-h-screen flex flex-col bg-[#141414] text-[#e8e8ea]">
         {children}
       </body>
     </html>

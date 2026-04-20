@@ -48,21 +48,30 @@ export function LoginForm({
   }
 
   return (
-    <div className="w-full max-w-sm bg-neutral-900 border border-neutral-800 rounded p-6 space-y-4">
-      <h1 className="text-lg font-semibold">ディレクターログイン</h1>
-      <p className="text-xs text-neutral-400">
+    <div className="w-full max-w-sm bg-[#1f1f22] border border-[#3a3a3f] rounded-lg p-6 space-y-4 shadow-[0_20px_50px_-15px_rgba(0,0,0,0.6)]">
+      <span className="text-xs text-[#70707a] tracking-wider">
+        AI-SITE-EDITOR
+      </span>
+      <h1 className="text-lg font-semibold text-[#f0f0f2]">
+        ディレクターログイン
+      </h1>
+      <p className="text-xs text-[#a9a9b0] leading-relaxed">
         Propagate の Google アカウントでサインインしてください。
       </p>
       <button
         type="button"
         onClick={handleGoogleSignIn}
         disabled={loading}
-        className="w-full py-2 rounded bg-white text-neutral-900 text-sm font-semibold disabled:bg-neutral-700 disabled:text-neutral-400 flex items-center justify-center gap-2 hover:bg-neutral-100 transition"
+        className="w-full py-2.5 rounded-md bg-white text-[#0b0b0d] text-sm font-semibold disabled:bg-[#2b2b30] disabled:text-[#55555c] flex items-center justify-center gap-2 hover:bg-[#f0f0f2] transition"
       >
         <GoogleIcon />
         {loading ? "リダイレクト中..." : "Google でサインイン"}
       </button>
-      {error && <p className="text-xs text-red-400">{error}</p>}
+      {error && (
+        <p className="text-xs text-red-300 bg-red-500/5 border border-red-500/30 rounded-md p-2">
+          {error}
+        </p>
+      )}
     </div>
   );
 }

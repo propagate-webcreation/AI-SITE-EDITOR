@@ -60,6 +60,7 @@ function makeDeps(params: {
       .mockResolvedValue(params.activeSession ?? null),
     listActiveByDirector: vi.fn(),
     updateStatus: vi.fn(),
+    deleteById: vi.fn(),
     getDirectorEmail: vi.fn().mockResolvedValue(null),
   };
   const sandbox = {

@@ -8,11 +8,22 @@ import { Type, type FunctionDeclaration } from "@google/genai";
 export interface SandboxRuntime {
   readFile(params: { path: string; cwd?: string }): Promise<string | null>;
   writeFile(params: { path: string; content: string }): Promise<void>;
+  /**
+   * バイナリ (画像など) を sandbox に書き出す。
+   * Gemini tool として公開はしない (controller 側が添付画像の pre-upload にだけ使う)。
+   */
+  writeBinaryFile(params: { path: string; content: Buffer }): Promise<void>;
   runCommand(params: {
     cmd: string;
     args?: string[];
     cwd?: string;
     timeoutMs?: number;
+    /**
+     * "mutating" コマンドは FS を変更しうる。run_bash がこれに該当。
+     * list_dir / glob / grep 等の読み取り専用ツールは false を明示する。
+     * 既定は true (= 安全側、commit 時は全差分対象)。
+     */
+    mutating?: boolean;
   }): Promise<{ stdout: string; stderr: string; exitCode: number }>;
 }
 
@@ -277,6 +288,7 @@ async function listDir(
     args: ["-lc", `ls -1 --color=never ${shellQuote(target)}`],
     cwd: ctx.defaultCwd,
     timeoutMs: 30_000,
+    mutating: false,
   });
   if (res.exitCode !== 0) {
     return { success: false, output: res.stderr || `ls exit ${res.exitCode}` };
@@ -298,6 +310,7 @@ async function glob(
     ],
     cwd: ctx.defaultCwd,
     timeoutMs: 30_000,
+    mutating: false,
   });
   if (res.exitCode !== 0) {
     return { success: false, output: res.stderr || `find exit ${res.exitCode}` };
@@ -321,6 +334,7 @@ async function grep(
     ],
     cwd: ctx.defaultCwd,
     timeoutMs: 60_000,
+    mutating: false,
   });
   return { success: true, output: res.stdout.trim() || "(no matches)" };
 }

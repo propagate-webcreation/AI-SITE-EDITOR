@@ -35,6 +35,10 @@ export interface RunAgentInput {
   cwd: string;
   signal?: AbortSignal;
   onToolCall?: (event: ToolCallEvent) => void;
+  /** 指定されると config.maxIterations を上書きする。全体指示用に使う。 */
+  maxIterationsOverride?: number;
+  /** 指定されると config.model を上書きする。全体指示モードで pro モデル等を使うため。 */
+  modelOverride?: string;
 }
 
 export interface ToolCallEvent {
@@ -80,8 +84,13 @@ export class GeminiAgentRunner {
     let toolUseCount = 0;
     let iteration = 0;
     let lastText = "";
+    const maxIterations = Math.max(
+      1,
+      input.maxIterationsOverride ?? this.config.maxIterations,
+    );
+    const model = input.modelOverride ?? this.config.model;
 
-    while (iteration < this.config.maxIterations) {
+    while (iteration < maxIterations) {
       iteration += 1;
       if (input.signal?.aborted) {
         return {
@@ -94,7 +103,7 @@ export class GeminiAgentRunner {
       }
 
       const response = await this.client.models.generateContent({
-        model: this.config.model,
+        model,
         contents: history,
         config: {
           systemInstruction: input.systemInstruction,
@@ -160,7 +169,7 @@ export class GeminiAgentRunner {
       finalMessage: lastText,
       iterations: iteration,
       toolUseCount,
-      errorMessage: `最大反復回数 ${this.config.maxIterations} に達しました`,
+      errorMessage: `最大反復回数 ${maxIterations} に達しました`,
     };
   }
 }

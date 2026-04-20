@@ -3,9 +3,13 @@ import "server-only";
 export interface AppEnv {
   geminiApiKey: string | undefined;
   geminiModel: string;
+  /**
+   * 全体指示モード用のモデル。未設定時は geminiModel を流用。
+   * 精度重視 (例: gemini-3-pro-preview) を推奨。
+   */
+  geminiGlobalModel: string;
   geminiMaxIterations: number;
   agentTimeoutSec: number;
-  correctionWorkflowTimeoutSec: number;
 
   githubToken: string | undefined;
   githubUsername: string;
@@ -77,15 +81,13 @@ function readSupabaseConfig(): AppEnv["supabase"] {
 }
 
 export function loadAppEnv(): AppEnv {
+  const geminiModel = process.env.GEMINI_MODEL ?? "gemini-3-flash-preview";
   return {
     geminiApiKey: readOptional("GEMINI_API_KEY"),
-    geminiModel: process.env.GEMINI_MODEL ?? "gemini-3.1-pro-preview",
+    geminiModel,
+    geminiGlobalModel: process.env.GEMINI_GLOBAL_MODEL ?? geminiModel,
     geminiMaxIterations: Math.floor(readNumber("GEMINI_MAX_ITERATIONS", 120)),
     agentTimeoutSec: readNumber("AGENT_TIMEOUT_SEC", 1800),
-    correctionWorkflowTimeoutSec: readNumber(
-      "CORRECTION_WORKFLOW_TIMEOUT_SEC",
-      18000,
-    ),
 
     githubToken: readOptional("GITHUB_TOKEN"),
     githubUsername: process.env.GITHUB_USERNAME ?? "propagate-webcreation",

@@ -1,16 +1,21 @@
 import { NextResponse } from "next/server";
 import {
   AuthRequiredError,
-  buildCorrectionContainer,
+  buildCaseLoadingContainer,
 } from "@/infrastructure/config/container";
-import { toClientApplication } from "@/presentation/controllers/correctionsController";
 
 export const maxDuration = 300;
 
+/**
+ * 指示の revert エンドポイント。
+ * client は localStorage に持っている `commitSha` を直接投げる。
+ * server は session の所有権を確認したあと、Sandbox に `git revert` を指示するだけ。
+ * DB には何も書かない (案件を閉じたら状態ごと破棄するため)。
+ */
 export async function POST(request: Request): Promise<Response> {
   let container;
   try {
-    container = await buildCorrectionContainer();
+    container = await buildCaseLoadingContainer();
   } catch (error) {
     if (error instanceof AuthRequiredError) {
       return NextResponse.json(
@@ -37,50 +42,33 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
-  const applicationId =
-    typeof (payload as { applicationId?: unknown })?.applicationId === "string"
-      ? (payload as { applicationId: string }).applicationId.trim()
+  const body = payload as {
+    sessionId?: unknown;
+    instructionId?: unknown;
+    commitSha?: unknown;
+    comment?: unknown;
+  };
+  const sessionId =
+    typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+  const instructionId =
+    typeof body.instructionId === "string" ? body.instructionId.trim() : "";
+  const commitSha =
+    typeof body.commitSha === "string" ? body.commitSha.trim() : "";
+  const commentHead =
+    typeof body.comment === "string"
+      ? body.comment.split("\n")[0]?.slice(0, 80) ?? ""
       : "";
-  if (!applicationId) {
+  if (!sessionId || !instructionId || !commitSha) {
     return NextResponse.json(
-      { ok: false, message: "applicationId が必要です。" },
+      {
+        ok: false,
+        message: "sessionId / instructionId / commitSha が必要です。",
+      },
       { status: 400 },
     );
   }
 
-  const app = await container.applications.getById(applicationId);
-  if (!app) {
-    return NextResponse.json(
-      { ok: false, message: "修正履歴が見つかりません。" },
-      { status: 404 },
-    );
-  }
-  if (app.status === "reverted") {
-    return NextResponse.json(
-      { ok: false, message: "この指示は既にロールバック済みです。" },
-      { status: 409 },
-    );
-  }
-  if (app.status !== "applied") {
-    return NextResponse.json(
-      {
-        ok: false,
-        message: `status=${app.status} の指示はロールバックできません。`,
-      },
-      { status: 409 },
-    );
-  }
-  if (!app.commitSha) {
-    return NextResponse.json(
-      {
-        ok: false,
-        message: "この指示に対応するコミットが記録されていません。",
-      },
-      { status: 409 },
-    );
-  }
-
-  const session = await container.sessions.getById(app.sessionId);
+  const session = await container.sessions.getById(sessionId);
   if (!session) {
     return NextResponse.json(
       { ok: false, message: "セッションが見つかりません。" },
@@ -103,19 +91,18 @@ export async function POST(request: Request): Promise<Response> {
   try {
     const revertSha = await container.sandbox.revertCommit({
       sandboxId: session.sandboxId,
-      targetCommitSha: app.commitSha,
+      targetCommitSha: commitSha,
       authorName: container.env.botGitAuthorName,
       authorEmail: container.env.botGitAuthorEmail,
       commitMessage:
-        `revert directors-bot: ${session.recordNumber} ${app.instructionId}\n\n` +
-        `rollback of ${app.commitSha.slice(0, 7)} (${(app.comment.split("\n")[0] ?? "").slice(0, 80)})`,
+        `revert directors-bot: ${session.recordNumber} ${instructionId}\n\n` +
+        `rollback of ${commitSha.slice(0, 7)}${commentHead ? ` (${commentHead})` : ""}`,
     });
 
-    await container.applications.update({
-      id: app.id,
-      status: "reverted",
+    return NextResponse.json({
+      ok: true,
+      message: "指示を元に戻しました。",
       revertCommitSha: revertSha,
-      revertedAt: new Date(),
     });
   } catch (error) {
     return NextResponse.json(
@@ -126,11 +113,4 @@ export async function POST(request: Request): Promise<Response> {
       { status: 500 },
     );
   }
-
-  const refreshed = await container.applications.getById(app.id);
-  return NextResponse.json({
-    ok: true,
-    message: "指示を元に戻しました。",
-    application: refreshed ? toClientApplication(refreshed) : null,
-  });
 }

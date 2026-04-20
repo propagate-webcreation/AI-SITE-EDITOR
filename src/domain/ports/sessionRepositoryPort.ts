@@ -26,6 +26,13 @@ export interface SessionRepositoryPort {
   }): Promise<void>;
 
   /**
+   * セッション行を物理削除する (instruction_applications / corrections は
+   * FK の on delete cascade により自動で一緒に消える)。
+   * 「案件を閉じる」で呼ばれる想定。directors / auth.users には影響しない。
+   */
+  deleteById(id: string): Promise<void>;
+
+  /**
    * director_id から email を逆引きする。見つからなければ null。
    * 主にセッション競合時に「誰が作業中か」を UI 表示するために使う。
    */

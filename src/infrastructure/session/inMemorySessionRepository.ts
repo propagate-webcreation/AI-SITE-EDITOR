@@ -84,4 +84,8 @@ export class InMemorySessionRepository implements SessionRepositoryPort {
       closedAt: params.closedAt ?? s.closedAt,
     });
   }
+
+  async deleteById(id: string): Promise<void> {
+    this.sessions.delete(id);
+  }
 }

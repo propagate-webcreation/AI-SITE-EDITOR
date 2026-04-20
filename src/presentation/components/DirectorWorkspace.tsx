@@ -12,6 +12,7 @@ import {
   type ChatSelector,
 } from "./ChatPane";
 import { CaseLoader, type LoadedCase } from "./CaseLoader";
+import { LogDrawer, type LogEntry } from "./LogDrawer";
 
 export interface InitialSessionSummary {
   sessionId: string;
@@ -39,6 +40,7 @@ interface ApiApplication {
   comment: string;
   pinIndex: number | null;
   orderIndex: number;
+  isGlobal?: boolean;
   status: ChatItemStatus;
   summary: string | null;
   errorMessage: string | null;
@@ -46,6 +48,50 @@ interface ApiApplication {
   revertCommitSha: string | null;
   attachments: { filename: string; mimeType: string; sizeBytes: number }[];
   selectors?: ChatSelector[];
+}
+
+type StreamEvent =
+  | {
+      kind: "phase";
+      phase: "prepare" | "regular" | "global" | "complete";
+      regularCount: number;
+      globalCount: number;
+    }
+  | {
+      kind: "instruction";
+      instructionId: string;
+      status:
+        | "queued"
+        | "running"
+        | "applied"
+        | "failed"
+        | "reverted"
+        | "unclear";
+      isGlobal: boolean;
+      commitSha?: string;
+      message?: string;
+    }
+  | {
+      kind: "toolCall";
+      instructionId: string;
+      name: string;
+      argsSummary: string;
+      success: boolean;
+      iteration: number;
+    }
+  | { kind: "log"; level: "info" | "warn" | "error"; message: string }
+  | {
+      kind: "result";
+      ok: boolean;
+      message: string;
+      applications: ApiApplication[];
+      durationSec: number;
+    };
+
+function shortInstructionId(id: string): string {
+  // "ins-1756781234-abc" → "abc"
+  const parts = id.split("-");
+  return parts[parts.length - 1] ?? id.slice(0, 6);
 }
 
 function workStorageKey(sessionId: string): string {
@@ -63,6 +109,7 @@ function loadPersistedWork(sessionId: string): PersistedWork | null {
         ? parsed.items.map((it) => ({
             ...it,
             selectors: Array.isArray(it.selectors) ? it.selectors : [],
+            isGlobal: typeof it.isGlobal === "boolean" ? it.isGlobal : false,
           }))
         : [],
       pendingSelectors: Array.isArray(parsed.pendingSelectors)
@@ -100,6 +147,54 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
+/**
+ * Sandbox の git log から得た commit 情報で localStorage の items を整合させる。
+ * - apply commit が見つかった instruction は `applied` + commitSha に昇格
+ * - revert commit が見つかった instruction は `reverted` に更新
+ * - git log に無い submitted/running は localStorage のまま残す (まだ commit 前かもしれない)
+ */
+function reconcileFromGitLog(
+  existing: ChatItem[],
+  commits: {
+    sha: string;
+    instructionId: string;
+    kind: "apply" | "revert";
+    targetSha?: string;
+    committedAt: number;
+  }[],
+): ChatItem[] {
+  if (commits.length === 0) return existing;
+  // instruction_id ごとの最新 commit 種別を決める
+  const latestByInstruction = new Map<
+    string,
+    { sha: string; kind: "apply" | "revert"; committedAt: number }
+  >();
+  for (const c of commits) {
+    const cur = latestByInstruction.get(c.instructionId);
+    if (!cur || c.committedAt > cur.committedAt) {
+      latestByInstruction.set(c.instructionId, {
+        sha: c.sha,
+        kind: c.kind,
+        committedAt: c.committedAt,
+      });
+    }
+  }
+  return existing.map((item) => {
+    const latest = latestByInstruction.get(item.id);
+    if (!latest) return item;
+    if (latest.kind === "revert") {
+      return { ...item, status: "reverted" as const };
+    }
+    // apply
+    if (item.status === "applied" && item.commitSha === latest.sha) return item;
+    return {
+      ...item,
+      status: "applied" as const,
+      commitSha: latest.sha,
+    };
+  });
+}
+
 function mergeFromServer(
   existing: ChatItem[],
   applications: ApiApplication[],
@@ -123,6 +218,7 @@ function mergeFromServer(
           base64: "",
         })),
       selectors: app.selectors ?? local?.selectors ?? [],
+      isGlobal: app.isGlobal ?? local?.isGlobal ?? false,
       status: app.status,
       applicationId: app.id,
       summary: app.summary ?? undefined,
@@ -171,6 +267,9 @@ export function DirectorWorkspace({
   );
   const [running, setRunning] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [closeModalOpen, setCloseModalOpen] = useState(false);
+  const [selectMode, setSelectMode] = useState(false);
   const [revertingItemId, setRevertingItemId] = useState<string | null>(null);
   const [lastResultMessage, setLastResultMessage] = useState<string | null>(
     initialSession
@@ -179,24 +278,48 @@ export function DirectorWorkspace({
   );
   const previewKeyRef = useRef(0);
   const [previewKey, setPreviewKey] = useState(0);
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
+  const logSeqRef = useRef(0);
+  const pushLog = useMemo(
+    () => (entry: Omit<LogEntry, "id" | "ts">) => {
+      logSeqRef.current += 1;
+      setLogEntries((prev) => [
+        ...prev,
+        { ...entry, id: `log-${logSeqRef.current}`, ts: Date.now() },
+      ]);
+    },
+    [],
+  );
 
+  // ページリロード時の reconcile: Sandbox の git log を見て、
+  // localStorage で submitted / running のまま止まっている item を
+  // 実際に commit された状態 (applied + commitSha) に昇格させる。
+  // あるいは revert commit が見つかれば reverted に更新。
   useEffect(() => {
     if (!loadedCase) return;
     let cancelled = false;
     (async () => {
       try {
         const resp = await fetch(
-          `/api/sessions/applications?sessionId=${encodeURIComponent(loadedCase.sessionId)}`,
+          `/api/sessions/reconcile?sessionId=${encodeURIComponent(loadedCase.sessionId)}`,
         );
         if (!resp.ok) return;
         const body = (await resp.json()) as {
           ok: boolean;
-          applications: ApiApplication[];
+          commits?: {
+            sha: string;
+            instructionId: string;
+            kind: "apply" | "revert";
+            targetSha?: string;
+            committedAt: number;
+          }[];
+          hasDirty?: boolean;
         };
         if (!body.ok || cancelled) return;
-        setItems((prev) => mergeFromServer(prev, body.applications));
+        const commits = body.commits ?? [];
+        setItems((prev) => reconcileFromGitLog(prev, commits));
       } catch {
-        /* noop */
+        /* noop: localStorage の状態のまま */
       }
     })();
     return () => {
@@ -241,6 +364,7 @@ export function DirectorWorkspace({
   async function handleSubmitInstruction(params: {
     comment: string;
     attachments: File[];
+    isGlobal: boolean;
   }): Promise<void> {
     const id = `ins-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const encoded = await Promise.all(
@@ -257,11 +381,12 @@ export function DirectorWorkspace({
         id,
         comment: params.comment,
         attachments: encoded,
-        selectors: pendingSelectors,
+        selectors: params.isGlobal ? [] : pendingSelectors,
+        isGlobal: params.isGlobal,
         status: "draft",
       },
     ]);
-    setPendingSelectors([]);
+    if (!params.isGlobal) setPendingSelectors([]);
   }
 
   async function handleRun(): Promise<void> {
@@ -271,11 +396,17 @@ export function DirectorWorkspace({
 
     setRunning(true);
     setLastResultMessage(null);
+    setLogEntries([]);
     setItems((prev) =>
       prev.map((it) =>
         it.status === "draft" ? { ...it, status: "submitted" as const } : it,
       ),
     );
+    let finalResult: {
+      ok: boolean;
+      message?: string;
+      applications?: ApiApplication[];
+    } | null = null;
     try {
       const resp = await fetch("/api/corrections", {
         method: "POST",
@@ -285,6 +416,7 @@ export function DirectorWorkspace({
           instructions: drafts.map((it) => ({
             id: it.id,
             comment: it.comment,
+            isGlobal: it.isGlobal,
             attachments: it.attachments.map((a) => ({
               filename: a.filename,
               mimeType: a.mimeType,
@@ -299,16 +431,50 @@ export function DirectorWorkspace({
           })),
         }),
       });
-      const data = (await resp.json()) as {
-        ok: boolean;
-        message?: string;
-        applications?: ApiApplication[];
-      };
-      if (Array.isArray(data.applications)) {
-        setItems((prev) => mergeFromServer(prev, data.applications!));
+
+      if (!resp.ok || !resp.body) {
+        // レガシー JSON フォールバック。5xx でも JSON が返ることがある。
+        const fallback = (await resp.json().catch(() => null)) as {
+          ok?: boolean;
+          message?: string;
+        } | null;
+        throw new Error(fallback?.message ?? `HTTP ${resp.status}`);
+      }
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const event = JSON.parse(trimmed) as StreamEvent;
+            handleStreamEvent(event);
+            if (event.kind === "result") {
+              finalResult = {
+                ok: event.ok,
+                message: event.message,
+                applications: event.applications,
+              };
+            }
+          } catch {
+            /* ignore malformed line */
+          }
+        }
+      }
+
+      if (finalResult && Array.isArray(finalResult.applications)) {
+        setItems((prev) => mergeFromServer(prev, finalResult!.applications!));
       }
       setLastResultMessage(
-        data.message ?? (data.ok ? "修正が完了しました" : "修正に失敗しました"),
+        finalResult?.message ??
+          (finalResult?.ok ? "修正が完了しました" : "修正に失敗しました"),
       );
       previewKeyRef.current += 1;
       setPreviewKey(previewKeyRef.current);
@@ -326,24 +492,92 @@ export function DirectorWorkspace({
     }
   }
 
+  function handleStreamEvent(event: StreamEvent): void {
+    if (event.kind === "phase") {
+      const phaseLabel =
+        event.phase === "prepare"
+          ? `準備完了 (通常 ${event.regularCount} / 全体 ${event.globalCount})`
+          : event.phase === "regular"
+            ? `通常指示を並列実行 (${event.regularCount} 件)`
+            : event.phase === "global"
+              ? `全体指示を順次実行 (${event.globalCount} 件)`
+              : "完了";
+      pushLog({ kind: "phase", phase: event.phase, headline: phaseLabel });
+    } else if (event.kind === "instruction") {
+      const statusLabel = {
+        queued: "キュー追加",
+        running: "実行開始",
+        applied: "✓ 反映済み",
+        failed: "× 失敗",
+        reverted: "元に戻した",
+        unclear: "判定不可",
+      }[event.status];
+      pushLog({
+        kind: "instruction",
+        instructionId: event.instructionId,
+        headline: `${shortInstructionId(event.instructionId)}${event.isGlobal ? " [全体]" : ""}  ${statusLabel}`,
+        detail: event.commitSha
+          ? event.commitSha.slice(0, 7)
+          : event.message?.slice(0, 120),
+        error: event.status === "failed",
+      });
+    } else if (event.kind === "toolCall") {
+      pushLog({
+        kind: "toolCall",
+        instructionId: event.instructionId,
+        headline: `${event.name} ${event.argsSummary}`,
+        detail: `#${event.iteration} ${event.success ? "ok" : "fail"}`,
+        error: !event.success,
+      });
+    } else if (event.kind === "log") {
+      pushLog({
+        kind: "log",
+        headline: event.message,
+        error: event.level === "error",
+      });
+    } else if (event.kind === "result") {
+      pushLog({
+        kind: "result",
+        headline: event.message,
+        detail: `${event.durationSec.toFixed(1)}s / ${event.applications.length} 件`,
+        error: !event.ok,
+      });
+    }
+  }
+
+  function handleDeleteDraft(itemId: string): void {
+    setItems((prev) =>
+      prev.filter((it) => !(it.id === itemId && it.status === "draft")),
+    );
+  }
+
   async function handleRevert(itemId: string): Promise<void> {
     if (!loadedCase || revertingItemId) return;
     const target = items.find((it) => it.id === itemId);
-    if (!target?.applicationId) return;
+    if (!target?.commitSha) return;
     setRevertingItemId(itemId);
     try {
       const resp = await fetch("/api/instructions/revert", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ applicationId: target.applicationId }),
+        body: JSON.stringify({
+          sessionId: loadedCase.sessionId,
+          instructionId: target.id,
+          commitSha: target.commitSha,
+          comment: target.comment,
+        }),
       });
       const data = (await resp.json()) as {
         ok: boolean;
         message?: string;
-        application?: ApiApplication;
+        revertCommitSha?: string;
       };
-      if (data.ok && data.application) {
-        setItems((prev) => mergeFromServer(prev, [data.application!]));
+      if (data.ok) {
+        setItems((prev) =>
+          prev.map((it) =>
+            it.id === itemId ? { ...it, status: "reverted" as const } : it,
+          ),
+        );
         setLastResultMessage(data.message ?? "指示を元に戻しました");
         previewKeyRef.current += 1;
         setPreviewKey(previewKeyRef.current);
@@ -390,38 +624,144 @@ export function DirectorWorkspace({
     }
   }
 
+  async function handleCloseCase(saveFirst: boolean): Promise<void> {
+    if (!loadedCase || closing) return;
+    setCloseModalOpen(false);
+    setClosing(true);
+    setLastResultMessage(
+      saveFirst ? "変更を保存してから閉じています..." : "案件を閉じています...",
+    );
+    try {
+      if (saveFirst) {
+        const saveResp = await fetch("/api/saves", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId: loadedCase.sessionId }),
+        });
+        const saveData = (await saveResp.json()) as {
+          ok: boolean;
+          message?: string;
+        };
+        if (!saveData.ok) {
+          setLastResultMessage(
+            saveData.message ?? "保存に失敗したため、案件は開いたままにしました。",
+          );
+          return;
+        }
+      }
+      const closeResp = await fetch("/api/sessions/close", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: loadedCase.sessionId }),
+      });
+      const closeData = (await closeResp.json()) as {
+        ok: boolean;
+        message?: string;
+      };
+      if (!closeData.ok) {
+        setLastResultMessage(closeData.message ?? "案件のクローズに失敗しました。");
+        return;
+      }
+      if (typeof window !== "undefined") {
+        try {
+          window.localStorage.removeItem(workStorageKey(loadedCase.sessionId));
+        } catch {
+          /* ignore */
+        }
+      }
+      setLoadedCase(null);
+      setItems([]);
+      setPendingSelectors([]);
+      previewKeyRef.current += 1;
+      setPreviewKey(previewKeyRef.current);
+      setLastResultMessage(
+        saveFirst
+          ? "変更を GitHub に保存してから案件を閉じました。"
+          : "案件を閉じました。",
+      );
+    } catch (error) {
+      setLastResultMessage(
+        error instanceof Error ? error.message : "通信エラーが発生しました",
+      );
+    } finally {
+      setClosing(false);
+    }
+  }
+
   const caseLabel = loadedCase
     ? `案件 ${loadedCase.recordNumber} | ${loadedCase.partnerName} | ${loadedCase.contractPlan}`
     : "案件未選択";
 
   return (
-    <div className="flex flex-col min-h-0 flex-1">
-      <header className="px-4 h-12 border-b border-neutral-800 flex items-center gap-4 text-sm">
-        <span className="font-semibold whitespace-nowrap">directors-bot-v1</span>
-        <CaseLoader onLoaded={handleCaseLoaded} />
-        <span className="text-neutral-400 truncate">| {caseLabel}</span>
+    <div className="flex flex-col h-[100dvh] min-h-[640px] min-w-[900px] bg-[#141414]">
+      <header className="px-4 h-12 border-b border-[#2d2d31] bg-[#1b1b1d] flex items-center gap-3 text-sm">
+        <span className="font-semibold text-[#e8e8ea] whitespace-nowrap tracking-wider">
+          AI-SITE-EDITOR
+        </span>
+        <div className="h-5 w-px bg-[#2d2d31]" />
+        {/* 案件操作クラスタ: Loader と Close は同一の責務なので詰めて配置 */}
+        <div className="flex items-center gap-2">
+          <CaseLoader onLoaded={handleCaseLoaded} />
+          {loadedCase && (
+            <button
+              type="button"
+              onClick={() => setCloseModalOpen(true)}
+              disabled={closing || running || saving}
+              className="inline-flex items-center justify-center h-[30px] px-3 rounded-md border border-red-500/30 bg-transparent text-xs font-semibold text-red-300/80 hover:border-red-500/60 hover:bg-red-500/10 hover:text-red-200 disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:border-red-500/30 disabled:hover:text-red-300/80 transition whitespace-nowrap"
+            >
+              {closing ? "閉じ中..." : "案件を閉じる"}
+            </button>
+          )}
+        </div>
+        {(loadedCase || lastResultMessage) && (
+          <div className="h-5 w-px bg-[#2d2d31]" />
+        )}
+        {loadedCase && (
+          <span className="text-[#a9a9b0] truncate text-xs shrink-0 max-w-[30ch]">
+            {caseLabel}
+          </span>
+        )}
         {lastResultMessage && (
-          <span className="flex-1 text-xs text-neutral-400 truncate">
+          <span className="flex-1 text-xs text-[#a9a9b0] truncate italic">
             {lastResultMessage}
           </span>
         )}
-        <div className="ml-auto flex items-center gap-3 text-xs text-neutral-400 whitespace-nowrap">
-          {directorEmail && <span>{directorEmail}</span>}
+        <div className="ml-auto flex items-center gap-3 text-xs text-[#a9a9b0] whitespace-nowrap">
+          {directorEmail && (
+            <span className="text-[#70707a]">{directorEmail}</span>
+          )}
           <button
             type="button"
             onClick={handleSignOut}
-            className="px-2 py-0.5 rounded border border-neutral-700 hover:border-neutral-500"
+            className="inline-flex items-center justify-center h-[30px] px-3 rounded-md border border-[#3a3a3f] bg-[#1b1b1d] hover:border-[#55555c] hover:text-[#e8e8ea] transition"
           >
             ログアウト
           </button>
         </div>
       </header>
-      <div className="flex flex-1 min-h-0">
-        <PreviewPane
-          previewUrl={loadedCase?.previewUrl ?? null}
-          onElementSelected={handleElementSelected}
-          reloadKey={previewKey}
+      {closeModalOpen && loadedCase && (
+        <CloseCaseModal
+          hasAppliedItems={hasAppliedItems}
+          onCancel={() => setCloseModalOpen(false)}
+          onDiscardAndClose={() => handleCloseCase(false)}
+          onSaveAndClose={() => handleCloseCase(true)}
         />
+      )}
+      <div className="flex flex-1 min-h-0">
+        <div className="flex flex-col flex-1 min-w-0 min-h-0">
+          <PreviewPane
+            previewUrl={loadedCase?.previewUrl ?? null}
+            onElementSelected={handleElementSelected}
+            reloadKey={previewKey}
+            selectMode={selectMode}
+            onSelectModeReset={() => setSelectMode(false)}
+          />
+          <LogDrawer
+            entries={logEntries}
+            running={running}
+            onClear={() => setLogEntries([])}
+          />
+        </div>
         <ChatPane
           items={items}
           pendingSelectors={pendingSelectors}
@@ -429,12 +769,80 @@ export function DirectorWorkspace({
           onSubmit={handleSubmitInstruction}
           onRun={handleRun}
           onRevert={handleRevert}
+          onDeleteDraft={handleDeleteDraft}
           onSave={handleSave}
           running={running}
           saving={saving}
           revertingItemId={revertingItemId}
           hasAppliedItems={hasAppliedItems}
+          selectMode={selectMode}
+          onToggleSelectMode={() => setSelectMode((v) => !v)}
+          selectModeAvailable={!!loadedCase?.previewUrl}
         />
+      </div>
+    </div>
+  );
+}
+
+function CloseCaseModal(props: {
+  hasAppliedItems: boolean;
+  onCancel: () => void;
+  onDiscardAndClose: () => void;
+  onSaveAndClose: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+      onClick={props.onCancel}
+      role="presentation"
+    >
+      <div
+        className="w-[460px] max-w-[92vw] rounded-lg border border-[#3a3a3f] bg-[#1f1f22] p-5 shadow-[0_20px_50px_-10px_rgba(0,0,0,0.7)]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="text-base font-semibold text-[#f0f0f2] tracking-wide">
+          {props.hasAppliedItems ? "変更を保存しますか？" : "案件を閉じますか？"}
+        </h2>
+        <p className="mt-2 text-sm text-[#a9a9b0] leading-relaxed">
+          {props.hasAppliedItems
+            ? "この案件には AI が適用した未保存の変更があります。保存せずに閉じると、Sandbox ごと破棄され変更は失われます。閉じると DB 上のこの案件の記録も削除されます（GitHub へ保存済みのコミットは残ります）。"
+            : "案件を閉じると Sandbox が停止し、DB 上のこの案件の記録も削除されます。他のディレクターが同じ案件を開けるようになります（ログイン情報は保持されます）。"}
+        </p>
+        <div className="mt-5 flex flex-col gap-2">
+          {props.hasAppliedItems ? (
+            <>
+              <button
+                type="button"
+                onClick={props.onSaveAndClose}
+                className="px-3 py-2 rounded-md bg-teal-500 text-[#0b0b0d] text-sm font-semibold hover:bg-teal-400 transition"
+              >
+                保存して閉じる
+              </button>
+              <button
+                type="button"
+                onClick={props.onDiscardAndClose}
+                className="px-3 py-2 rounded-md bg-red-500/90 text-white text-sm font-semibold hover:bg-red-500 transition"
+              >
+                保存せずに閉じる
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={props.onDiscardAndClose}
+              className="px-3 py-2 rounded-md bg-red-500/90 text-white text-sm font-semibold hover:bg-red-500 transition"
+            >
+              はい、閉じる
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={props.onCancel}
+            className="px-3 py-2 rounded-md border border-[#3a3a3f] bg-[#1b1b1d] text-sm text-[#a9a9b0] hover:border-[#55555c] hover:text-[#e8e8ea] transition"
+          >
+            キャンセル
+          </button>
+        </div>
       </div>
     </div>
   );

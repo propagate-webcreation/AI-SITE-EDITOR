@@ -14,6 +14,10 @@ interface PreviewPaneProps {
   onElementSelected?: (sel: PreviewSelectorPayload) => void;
   /** 値が変わるたびに iframe を強制リロードする */
   reloadKey?: number;
+  /** 選択モードの状態 (ChatPane のトグルから制御される) */
+  selectMode: boolean;
+  /** 要素選択完了 / キャンセル / Esc などで選択モードを外したいとき */
+  onSelectModeReset: () => void;
 }
 
 const VIEWPORT_WIDTH = 1440;
@@ -23,11 +27,12 @@ export function PreviewPane({
   previewUrl,
   onElementSelected,
   reloadKey = 0,
+  selectMode,
+  onSelectModeReset,
 }: PreviewPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [scale, setScale] = useState(1);
-  const [selectMode, setSelectMode] = useState(false);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -47,11 +52,11 @@ export function PreviewPane({
   useEffect(() => {
     if (!selectMode) return;
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setSelectMode(false);
+      if (e.key === "Escape") onSelectModeReset();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [selectMode]);
+  }, [selectMode, onSelectModeReset]);
 
   // iframe からの postMessage (要素選択結果) を受け取る
   useEffect(() => {
@@ -73,14 +78,14 @@ export function PreviewPane({
             html: p.html,
           });
         }
-        setSelectMode(false);
+        onSelectModeReset();
       } else if (data.type === "directors-bot:selection-cancel") {
-        setSelectMode(false);
+        onSelectModeReset();
       }
     };
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, [onElementSelected]);
+  }, [onElementSelected, onSelectModeReset]);
 
   // selectMode の変化を iframe に送信
   useEffect(() => {
@@ -96,46 +101,40 @@ export function PreviewPane({
     );
   }, [selectMode]);
 
-  function toggleSelectMode(): void {
-    setSelectMode((v) => !v);
-  }
-
   const scaledWidth = VIEWPORT_WIDTH * scale;
   const scaledHeight = VIEWPORT_HEIGHT * scale;
 
   return (
-    <section className="flex-1 flex flex-col min-h-0 border-r border-neutral-800">
-      <div className="px-4 h-10 border-b border-neutral-800 text-sm text-neutral-400 flex items-center gap-2">
-        <span className="font-medium text-neutral-100">プレビュー</span>
-        <span className="text-xs text-neutral-500">
-          {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT} ({Math.round(scale * 100)}%)
+    <section className="flex-1 flex flex-col min-h-0 border-r border-[#2d2d31] bg-[#141414]">
+      <div className="px-4 h-10 border-b border-[#2d2d31] bg-[#1b1b1d] text-sm text-[#a9a9b0] flex items-center gap-3">
+        <span className="text-xs font-medium text-[#d0d0d4]">プレビュー</span>
+        <span className="text-[10px] font-mono text-[#70707a] tabular-nums">
+          {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}
+          <span className="mx-1 text-[#55555c]">·</span>
+          {Math.round(scale * 100)}%
         </span>
-        <button
-          type="button"
-          onClick={toggleSelectMode}
-          disabled={!previewUrl}
-          className={`ml-3 px-2 py-0.5 rounded text-xs font-semibold border transition ${
-            selectMode
-              ? "bg-sky-500 text-white border-sky-500"
-              : "border-neutral-700 text-neutral-200 hover:border-sky-500 hover:text-sky-300"
-          } disabled:opacity-50`}
-          title="プレビュー内の HTML 要素をクリックで選択し、指示にタグとして添付します"
-        >
-          {selectMode ? "🏷️ 要素選択中 (Esc で解除)" : "🏷️ 要素を選択"}
-        </button>
+        {selectMode && (
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-amber-500/15 border border-amber-500/40 text-[10px] font-medium text-amber-200">
+            <span className="font-mono text-amber-400">&lt;/&gt;</span>
+            要素選択中 · Esc で解除
+          </span>
+        )}
         {previewUrl && (
-          <span className="ml-auto truncate text-xs" title={previewUrl}>
+          <span
+            className="ml-auto truncate text-[10px] font-mono text-[#70707a]"
+            title={previewUrl}
+          >
             {previewUrl}
           </span>
         )}
       </div>
       <div
         ref={containerRef}
-        className="relative flex-1 min-h-0 bg-neutral-900 overflow-hidden flex items-center justify-center"
+        className="relative flex-1 min-h-0 bg-[#121214] overflow-hidden flex items-center justify-center"
       >
         {previewUrl ? (
           <div
-            className="relative bg-white shadow-2xl"
+            className="relative bg-white shadow-[0_10px_40px_-10px_rgba(0,0,0,0.7)] ring-1 ring-black/30"
             style={{ width: `${scaledWidth}px`, height: `${scaledHeight}px` }}
           >
             <iframe
@@ -153,9 +152,9 @@ export function PreviewPane({
             />
           </div>
         ) : (
-          <div className="text-neutral-500 text-sm">
-            デモサイトを選択してください
-          </div>
+          <span className="text-sm text-[#55555c]">
+            案件を読み込むとここにプレビューが表示されます
+          </span>
         )}
       </div>
     </section>

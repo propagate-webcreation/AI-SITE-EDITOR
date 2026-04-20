@@ -8,6 +8,7 @@ function makeSandbox(overrides: Partial<SandboxRuntime> = {}): SandboxRuntime {
   return {
     readFile: vi.fn().mockResolvedValue(null),
     writeFile: vi.fn().mockResolvedValue(undefined),
+    writeBinaryFile: vi.fn().mockResolvedValue(undefined),
     runCommand: vi.fn().mockResolvedValue({
       stdout: "",
       stderr: "",
