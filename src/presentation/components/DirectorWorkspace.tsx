@@ -815,15 +815,22 @@ export function DirectorWorkspace({
         />
       )}
       <div className="flex flex-1 min-h-0">
-        <PreviewPane
-          previewUrl={loadedCase?.previewUrl ?? null}
-          onElementSelected={handleElementSelected}
-          reloadKey={previewKey}
-          selectMode={selectMode}
-          onSelectModeReset={() => setSelectMode(false)}
-          onRestartDevServer={handleRestartDevServer}
-          restartingDevServer={restartingDevServer}
-        />
+        <div className="flex flex-col flex-1 min-w-0 min-h-0">
+          <PreviewPane
+            previewUrl={loadedCase?.previewUrl ?? null}
+            onElementSelected={handleElementSelected}
+            reloadKey={previewKey}
+            selectMode={selectMode}
+            onSelectModeReset={() => setSelectMode(false)}
+            onRestartDevServer={handleRestartDevServer}
+            restartingDevServer={restartingDevServer}
+          />
+          <LogDrawer
+            entries={logEntries}
+            running={running}
+            onClear={() => setLogEntries([])}
+          />
+        </div>
         <ChatPane
           items={items}
           pendingSelectors={pendingSelectors}
@@ -842,11 +849,6 @@ export function DirectorWorkspace({
           selectModeAvailable={!!loadedCase?.previewUrl}
         />
       </div>
-      <LogDrawer
-        entries={logEntries}
-        running={running}
-        onClear={() => setLogEntries([])}
-      />
     </div>
   );
 }

@@ -438,6 +438,8 @@ export function ChatPane({
           </div>
         )}
       </form>
+      {/* 左カラムの LogDrawer (border-t 1px + h-8 button = 33px) と高さを揃える */}
+      <div className="h-[33px] border-t border-[#2d2d31] bg-[#1b1b1d] shrink-0" />
     </section>
   );
 }
