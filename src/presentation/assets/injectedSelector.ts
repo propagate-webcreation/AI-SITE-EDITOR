@@ -13,9 +13,14 @@ export const INJECTED_SELECTOR_SCRIPT = `(() => {
 
   const OVERLAY_COLOR = 'rgba(236, 72, 72, 0.18)';
   const OVERLAY_BORDER = '2px solid #dc2626';
+  const HIGHLIGHT_COLOR = 'rgba(245, 158, 11, 0.18)';
+  const HIGHLIGHT_BORDER = '2px solid #f59e0b';
   let active = false;
   let hoverEl = null;
   let overlayEl = null;
+  let highlightSelectors = [];
+  let highlightOverlays = [];
+  let highlightRaf = null;
 
   function ensureOverlay() {
     if (overlayEl) return overlayEl;
@@ -103,6 +108,85 @@ export const INJECTED_SELECTOR_SCRIPT = `(() => {
     removeOverlay();
   }
 
+  function clearHighlights() {
+    highlightOverlays.forEach((el) => el.remove());
+    highlightOverlays = [];
+    highlightSelectors = [];
+    if (highlightRaf) {
+      cancelAnimationFrame(highlightRaf);
+      highlightRaf = null;
+    }
+  }
+  function reflowHighlights() {
+    for (let i = 0; i < highlightOverlays.length; i += 1) {
+      const ov = highlightOverlays[i];
+      const sel = highlightSelectors[i];
+      let el = null;
+      try {
+        el = sel ? document.querySelector(sel) : null;
+      } catch (_err) {
+        el = null;
+      }
+      if (!el) {
+        ov.style.display = 'none';
+        continue;
+      }
+      const r = el.getBoundingClientRect();
+      ov.style.display = '';
+      ov.style.left = r.left + 'px';
+      ov.style.top = r.top + 'px';
+      ov.style.width = r.width + 'px';
+      ov.style.height = r.height + 'px';
+    }
+  }
+  function scheduleReflow() {
+    if (highlightRaf) return;
+    highlightRaf = requestAnimationFrame(() => {
+      highlightRaf = null;
+      reflowHighlights();
+    });
+  }
+  function setHighlights(selectors) {
+    clearHighlights();
+    if (!selectors || selectors.length === 0) return;
+    highlightSelectors = selectors.slice();
+    for (let i = 0; i < selectors.length; i += 1) {
+      const ov = document.createElement('div');
+      ov.style.cssText = [
+        'position:fixed',
+        'pointer-events:none',
+        'z-index:2147483646',
+        'box-sizing:border-box',
+        'background:' + HIGHLIGHT_COLOR,
+        'border:' + HIGHLIGHT_BORDER,
+        'border-radius:2px',
+        'transition:opacity 120ms ease-out',
+      ].join(';');
+      document.body.appendChild(ov);
+      highlightOverlays.push(ov);
+    }
+    reflowHighlights();
+    // 最初の対象要素が画面外ならスクロールで見える位置へ。
+    let firstEl = null;
+    try {
+      firstEl = document.querySelector(selectors[0]);
+    } catch (_err) {
+      firstEl = null;
+    }
+    if (firstEl) {
+      const r = firstEl.getBoundingClientRect();
+      const offscreen =
+        r.bottom < 0 ||
+        r.top > (window.innerHeight || document.documentElement.clientHeight);
+      if (offscreen) {
+        firstEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }
+  }
+
+  window.addEventListener('scroll', scheduleReflow, true);
+  window.addEventListener('resize', scheduleReflow);
+
   document.addEventListener(
     'mouseover',
     (e) => {
@@ -167,6 +251,9 @@ export const INJECTED_SELECTOR_SCRIPT = `(() => {
     if (!data || typeof data !== 'object') return;
     if (data.type === 'directors-bot:enable-selection') enable();
     else if (data.type === 'directors-bot:disable-selection') disable();
+    else if (data.type === 'directors-bot:highlight-selectors')
+      setHighlights(Array.isArray(data.selectors) ? data.selectors : []);
+    else if (data.type === 'directors-bot:clear-highlights') clearHighlights();
     else if (data.type === 'directors-bot:ping')
       window.parent.postMessage({ type: 'directors-bot:ready' }, '*');
   });

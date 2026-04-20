@@ -87,7 +87,7 @@ export function CaseLoader({ onLoaded }: CaseLoaderProps) {
         value={recordNumber}
         onChange={(e) => setRecordNumber(e.target.value)}
         placeholder="例: 001"
-        className="w-24 h-[30px] rounded-md bg-[#0f0f11] border border-[#3a3a3f] px-2 text-sm text-[#e8e8ea] placeholder:text-[#55555c] focus:outline-none focus:border-amber-500/50 transition disabled:opacity-50"
+        className="w-40 h-[30px] rounded-md bg-[#0f0f11] border border-[#3a3a3f] px-2 text-sm text-[#e8e8ea] placeholder:text-[#55555c] focus:outline-none focus:border-amber-500/50 transition disabled:opacity-50"
         disabled={loading}
       />
       <button

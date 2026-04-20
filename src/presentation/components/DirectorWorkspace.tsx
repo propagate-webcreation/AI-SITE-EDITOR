@@ -29,6 +29,8 @@ interface DirectorWorkspaceProps {
   initialSession: InitialSessionSummary | null;
 }
 
+const EMPTY_STRING_ARRAY: readonly string[] = Object.freeze([]);
+
 interface PersistedWork {
   items: ChatItem[];
   pendingSelectors: ChatSelector[];
@@ -283,6 +285,9 @@ export function DirectorWorkspace({
   const [selectMode, setSelectMode] = useState(false);
   const [revertingItemId, setRevertingItemId] = useState<string | null>(null);
   const [restartingDevServer, setRestartingDevServer] = useState(false);
+  const [activeHighlightItemId, setActiveHighlightItemId] = useState<
+    string | null
+  >(null);
   const [lastResultMessage, setLastResultMessage] = useState<string | null>(
     initialSession
       ? `案件 ${initialSession.recordNumber} (${initialSession.partnerName}) を復元しました`
@@ -351,6 +356,23 @@ export function DirectorWorkspace({
     () => items.some((it) => it.status === "applied"),
     [items],
   );
+
+  // ハイライト対象の CSS selector 配列。active item が無い / applied でない / selector 無しなら空。
+  const highlightSelectors = useMemo<readonly string[]>(() => {
+    if (!activeHighlightItemId) return EMPTY_STRING_ARRAY;
+    const item = items.find((it) => it.id === activeHighlightItemId);
+    if (!item || item.status !== "applied") return EMPTY_STRING_ARRAY;
+    return item.selectors.map((s) => s.selector);
+  }, [activeHighlightItemId, items]);
+
+  // active item が applied 以外になったら自動で解除 (revert 直後など)
+  useEffect(() => {
+    if (!activeHighlightItemId) return;
+    const item = items.find((it) => it.id === activeHighlightItemId);
+    if (!item || item.status !== "applied") {
+      setActiveHighlightItemId(null);
+    }
+  }, [activeHighlightItemId, items]);
 
   function handleCaseLoaded(loaded: LoadedCase): void {
     setLoadedCase(loaded);
@@ -824,6 +846,7 @@ export function DirectorWorkspace({
             onSelectModeReset={() => setSelectMode(false)}
             onRestartDevServer={handleRestartDevServer}
             restartingDevServer={restartingDevServer}
+            highlightSelectors={highlightSelectors}
           />
           <LogDrawer
             entries={logEntries}
@@ -847,6 +870,10 @@ export function DirectorWorkspace({
           selectMode={selectMode}
           onToggleSelectMode={() => setSelectMode((v) => !v)}
           selectModeAvailable={!!loadedCase?.previewUrl}
+          activeHighlightItemId={activeHighlightItemId}
+          onToggleHighlight={(id) =>
+            setActiveHighlightItemId((cur) => (cur === id ? null : id))
+          }
         />
       </div>
     </div>

@@ -64,6 +64,10 @@ interface ChatPaneProps {
   selectMode: boolean;
   onToggleSelectMode: () => void;
   selectModeAvailable: boolean;
+  /** ハイライト表示中の applied item id。null なら未選択 */
+  activeHighlightItemId?: string | null;
+  /** applied item をクリックしたときに呼ばれる (同じ id なら解除、違えば切替) */
+  onToggleHighlight?: (itemId: string) => void;
 }
 
 export function ChatPane({
@@ -82,6 +86,8 @@ export function ChatPane({
   selectMode,
   onToggleSelectMode,
   selectModeAvailable,
+  activeHighlightItemId = null,
+  onToggleHighlight,
 }: ChatPaneProps) {
   const [comment, setComment] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -195,10 +201,24 @@ export function ChatPane({
             下のフォームで指示を追加してください
           </li>
         )}
-        {items.map((item, index) => (
+        {items.map((item, index) => {
+          const canHighlight =
+            item.status === "applied" && item.selectors.length > 0;
+          const isActiveHighlight =
+            canHighlight && activeHighlightItemId === item.id;
+          return (
           <li
             key={item.id}
-            className="p-4 space-y-2 hover:bg-[#1b1b1e] transition-colors"
+            onClick={
+              canHighlight ? () => onToggleHighlight?.(item.id) : undefined
+            }
+            className={`p-4 space-y-2 transition-colors border-l-2 ${
+              isActiveHighlight
+                ? "border-amber-500/70 bg-amber-500/5 hover:bg-amber-500/10 cursor-pointer"
+                : canHighlight
+                  ? "border-transparent hover:bg-[#1b1b1e] cursor-pointer"
+                  : "border-transparent hover:bg-[#1b1b1e]"
+            }`}
           >
             <div className="flex items-center gap-2 text-xs">
               <span className="text-[#55555c] font-mono text-[10px] tabular-nums">
@@ -218,11 +238,19 @@ export function ChatPane({
                   {item.commitSha.slice(0, 7)}
                 </span>
               )}
+              {isActiveHighlight && (
+                <span className="text-[10px] font-medium text-amber-200">
+                  プレビューに表示中
+                </span>
+              )}
               <div className="ml-auto">
                 {item.status === "applied" && item.commitSha && (
                   <button
                     type="button"
-                    onClick={() => onRevert(item.id)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onRevert(item.id);
+                    }}
                     disabled={revertingItemId === item.id || saving}
                     className="px-2 py-0.5 rounded border border-[#3a3a3f] bg-[#1b1b1d] text-[10px] text-[#a9a9b0] hover:border-red-500/70 hover:text-red-300 hover:bg-red-500/10 transition disabled:opacity-40"
                   >
@@ -232,7 +260,10 @@ export function ChatPane({
                 {item.status === "draft" && (
                   <button
                     type="button"
-                    onClick={() => onDeleteDraft(item.id)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteDraft(item.id);
+                    }}
                     disabled={running || saving}
                     title="この下書きを削除"
                     aria-label="下書きを削除"
@@ -290,7 +321,8 @@ export function ChatPane({
               </div>
             )}
           </li>
-        ))}
+          );
+        })}
       </ul>
       <form
         onSubmit={handleSubmit}
@@ -312,7 +344,7 @@ export function ChatPane({
             className={`flex-1 inline-flex items-center justify-center gap-1 h-[30px] rounded-md border text-[11px] transition disabled:opacity-40 disabled:cursor-not-allowed ${
               selectMode
                 ? "bg-amber-500/90 text-[#0b0b0d] border-amber-500"
-                : "border-[#3a3a3f] bg-[#1b1b1d] text-[#d0d0d4] hover:border-amber-500/60 hover:text-amber-200 hover:bg-amber-500/5"
+                : "border-[#3a3a3f] bg-[#1b1b1d] text-[#a9a9b0] hover:border-amber-500/60 hover:text-amber-200 hover:bg-amber-500/5"
             }`}
             title="プレビュー内の HTML 要素をクリックで選択し、指示にタグとして添付します"
           >
@@ -325,7 +357,7 @@ export function ChatPane({
             </span>
             <span>要素</span>
           </button>
-          <label className="flex-1 cursor-pointer inline-flex items-center justify-center gap-1 h-[30px] rounded-md border border-[#3a3a3f] bg-[#1b1b1d] text-[11px] text-[#a9a9b0] hover:border-amber-500/60 hover:text-amber-300 transition">
+          <label className="flex-1 cursor-pointer inline-flex items-center justify-center gap-1 h-[30px] rounded-md border border-[#3a3a3f] bg-[#1b1b1d] text-[11px] text-[#a9a9b0] hover:border-amber-500/60 hover:text-amber-200 transition">
             <input
               ref={fileInputRef}
               type="file"
@@ -351,7 +383,7 @@ export function ChatPane({
             className={`flex-1 inline-flex items-center justify-center gap-1.5 h-[30px] rounded-md border text-[11px] transition ${
               isGlobal
                 ? "border-violet-500/70 bg-violet-500/10 text-violet-200"
-                : "border-[#3a3a3f] bg-[#1b1b1d] text-[#a9a9b0] hover:border-violet-500/60 hover:text-violet-300"
+                : "border-[#3a3a3f] bg-[#1b1b1d] text-[#a9a9b0] hover:border-violet-500/60 hover:text-violet-200"
             }`}
             title="押すと、他の指示がすべて完了した後にこの指示だけ単独で実行されます。サイト全体のトーン変更などに。"
           >
@@ -435,8 +467,8 @@ export function ChatPane({
           </div>
         )}
       </form>
-      {/* 左カラムの LogDrawer (border-t 1px + h-8 button = 33px) と高さを揃える */}
-      <div className="h-[33px] border-t border-[#2d2d31] bg-[#1b1b1d] shrink-0" />
+      {/* 左カラムの LogDrawer (border-t 1px + h-8 button = 33px) と高さ・色を揃える */}
+      <div className="h-[33px] border-t border-[#2d2d31] bg-[#17171a] shrink-0" />
     </section>
   );
 }
