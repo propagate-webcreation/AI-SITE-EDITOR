@@ -1,12 +1,116 @@
 /**
  * Sandbox 上の Next.js アプリに inject するクライアントサイドスクリプト。
  *
- * 親ウィンドウ (directors-bot-v1) からの postMessage でモード切り替え、
- * ユーザーがクリックした要素の CSS selector / HTML / テキストを postMessage で返す。
+ * - EARLY_PATCH_SCRIPT:
+ *     layout.tsx に inline の raw `<script dangerouslySetInnerHTML>` として埋め込まれ、
+ *     HTML パース時同期実行で hydration より前に走らせる。
+ *     Next.js の `<Script strategy="beforeInteractive">` は App Router では
+ *     「hydration をブロックしない」仕様なので、timing critical な
+ *     matchMedia spoof / IntersectionObserver パッチはそこでは間に合わない。
+ *     framer-motion の useReducedMotion / useInView が初期化される前に
+ *     確実に走らせる必要があるためここに分離している。
  *
- * このコード全体が `public/directors-bot-selector.js` として Sandbox に書き込まれる。
- * IIFE で即時実行。global は汚さない。
+ * - INJECTED_SELECTOR_SCRIPT:
+ *     `public/directors-bot-selector.js` として書き込まれ、
+ *     `<Script strategy="beforeInteractive">` 経由で load される要素選択・
+ *     ハイライト表示のロジック。親から postMessage でモード切り替えされるだけで
+ *     hydration タイミングに依存しない。
  */
+
+// HTML パース時に同期実行される早期パッチ。iframe 内 (self !== top) でのみ発動。
+// dangerouslySetInnerHTML 経由で JSX に文字列リテラルとして埋まるため、
+// 埋め込み時は JSON.stringify で安全にエスケープされる前提で書いている。
+export const EARLY_PATCH_SCRIPT = `(function(){
+  try { if (window.self === window.top) return; } catch (_e) { /* iframe 扱い */ }
+  try {
+    var origMM = window.matchMedia ? window.matchMedia.bind(window) : null;
+    var fake = function (q, m) {
+      return {
+        matches: m,
+        media: q,
+        onchange: null,
+        addEventListener: function () {},
+        removeEventListener: function () {},
+        addListener: function () {},
+        removeListener: function () {},
+        dispatchEvent: function () { return true; }
+      };
+    };
+    window.matchMedia = function (q) {
+      if (typeof q === 'string' && /prefers-reduced-motion/.test(q)) {
+        // 値部分だけ match。property 名 "prefers-reduced-motion" の "reduced" に
+        // 引っかからないよう \\b で境界を明示する。
+        return fake(q, /reduce\\b/.test(q));
+      }
+      return origMM ? origMM(q) : fake(q, false);
+    };
+  } catch (_e) { /* ignore */ }
+  try {
+    var NativeIO = window.IntersectionObserver;
+    if (NativeIO) {
+      var Patched = function (cb, opts) {
+        var inst = new NativeIO(cb, opts);
+        var origObserve = inst.observe.bind(inst);
+        inst.observe = function (target) {
+          origObserve(target);
+          // 二重 RAF で native IO の初期 callback (isIntersecting:false) の後に
+          // 合成 true を流す。viewport.once:true なら framer-motion が unobserve
+          // するので以降の native 挙動に干渉しない。
+          requestAnimationFrame(function () {
+            requestAnimationFrame(function () {
+              try {
+                var r = target.getBoundingClientRect();
+                cb([{
+                  target: target,
+                  isIntersecting: true,
+                  intersectionRatio: 1,
+                  boundingClientRect: r,
+                  intersectionRect: r,
+                  rootBounds: null,
+                  time: (performance && performance.now) ? performance.now() : Date.now()
+                }], inst);
+              } catch (_err) { /* ignore */ }
+            });
+          });
+        };
+        return inst;
+      };
+      Patched.prototype = NativeIO.prototype;
+      window.IntersectionObserver = Patched;
+    }
+  } catch (_e) { /* ignore */ }
+
+  // Safety net: sandbox preview + Turbopack dev + scaled iframe の組み合わせで
+  // framer-motion の mount 時 animate が発火せず、SSR で焼き込まれた
+  // inline style="opacity:0" のまま残るケースがある。prod では正しく動くので
+  // iframe 特有の問題。hydration + mount が落ち着いた後の時点で、
+  // inline opacity:0 を残している要素を強制的に可視に戻す。
+  // framer-motion が正常に動いていれば既に opacity:1 になっていて何もしない。
+  try {
+    var forceShow = function () {
+      var nodes = document.querySelectorAll('[style]');
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        if (el && el.style) {
+          if (el.style.opacity === '0') {
+            el.style.removeProperty('opacity');
+          }
+          var tr = el.style.transform || '';
+          if (/translate/.test(tr)) {
+            // framer-motion の mount 初期状態が translate(Y?) で少し下に
+            // ずれている場合があるので、opacity:0 をクリアする対象には合わせて外す。
+            el.style.removeProperty('transform');
+          }
+        }
+      }
+    };
+    // 1 回目: hydration + framer-motion の mount が終わった想定のタイミング。
+    // 2 回目: 遅延 hydration / 後からマウントする dynamic import 対策。
+    setTimeout(forceShow, 1500);
+    setTimeout(forceShow, 3500);
+  } catch (_e) { /* ignore */ }
+})();`;
+
 export const INJECTED_SELECTOR_SCRIPT = `(() => {
   if (window.__directorsBotSelector) return;
   window.__directorsBotSelector = true;

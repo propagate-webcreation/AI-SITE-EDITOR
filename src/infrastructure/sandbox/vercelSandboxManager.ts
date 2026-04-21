@@ -1,7 +1,10 @@
 import "server-only";
 import { Sandbox } from "@vercel/sandbox";
 import type { SandboxRuntime } from "@/infrastructure/gemini/sandboxTools";
-import { INJECTED_SELECTOR_SCRIPT } from "@/presentation/assets/injectedSelector";
+import {
+  EARLY_PATCH_SCRIPT,
+  INJECTED_SELECTOR_SCRIPT,
+} from "@/presentation/assets/injectedSelector";
 
 export interface VercelSandboxCreds {
   oidcToken?: string;
@@ -708,8 +711,17 @@ async function injectDomSelectorScript(sandbox: Sandbox): Promise<void> {
 /**
  * layout.tsx の文字列に:
  *   - `import Script from "next/script";` (未 import 時のみ)
- *   - `<body>` 直後に `<Script src="/directors-bot-selector.js" strategy="beforeInteractive" />`
+ *   - `<body>` 直後に、順番に
+ *     1. `<script dangerouslySetInnerHTML>` (EARLY_PATCH_SCRIPT を inline 埋め込み)
+ *        — hydration を確実にブロックする同期スクリプト。matchMedia spoof /
+ *        IntersectionObserver パッチはここで走る。
+ *     2. `<Script src="/directors-bot-selector.js" strategy="beforeInteractive" />`
+ *        — 要素選択ロジック本体 (タイミング非依存)。
  * を挿入する。
+ *
+ * `beforeInteractive` は App Router では「preload するが hydration をブロックしない」
+ * 仕様で timing critical パッチには間に合わないため、1 の inline `<script>` は
+ * Next の Script コンポーネントを経由させない。
  */
 function patchLayoutSource(src: string): string {
   let out = src;
@@ -732,13 +744,15 @@ function patchLayoutSource(src: string): string {
     }
   }
 
-  // <body ...> の直後に Script コンポーネントを挿入
+  // <body ...> の直後に inline <script> と <Script> を挿入
   const bodyOpen = /<body([^>]*)>/;
-  const scriptTag =
+  const inlineEarlyPatch =
+    `\n        <script dangerouslySetInnerHTML={{ __html: ${JSON.stringify(EARLY_PATCH_SCRIPT)} }} />`;
+  const selectorScript =
     '\n        <Script src="/directors-bot-selector.js" strategy="beforeInteractive" />';
   const matched = out.match(bodyOpen);
   if (matched) {
-    out = out.replace(bodyOpen, `<body$1>${scriptTag}`);
+    out = out.replace(bodyOpen, `<body$1>${inlineEarlyPatch}${selectorScript}`);
   }
   return out;
 }
