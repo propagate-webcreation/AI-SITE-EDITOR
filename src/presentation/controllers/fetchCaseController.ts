@@ -32,6 +32,8 @@ export interface FetchCaseSuccess {
     partnerName: string;
     contractPlan: string;
     githubRepoUrl: string;
+    /** Vercel 本番デプロイ URL。スプレッドシートに記載があれば返す。 */
+    deployUrl?: string;
   };
 }
 
@@ -177,6 +179,7 @@ function toCaseResponse(caseRecord: CaseRecord): FetchCaseSuccess["case"] {
     partnerName: caseRecord.partnerName,
     contractPlan: caseRecord.contractPlan,
     githubRepoUrl: caseRecord.githubRepoUrl,
+    deployUrl: caseRecord.deployUrl,
   };
 }
 

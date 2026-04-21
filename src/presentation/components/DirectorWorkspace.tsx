@@ -30,6 +30,8 @@ export interface InitialSessionSummary {
   githubRepoUrl: string;
   previewUrl: string;
   expiresAt: string;
+  /** Vercel 本番デプロイ URL。スプレッドシート由来。無いケースもあり。 */
+  deployUrl?: string;
 }
 
 interface DirectorWorkspaceProps {
@@ -283,6 +285,7 @@ function loadedFromInitial(s: InitialSessionSummary): LoadedCase {
     githubRepoUrl: s.githubRepoUrl,
     previewUrl: s.previewUrl,
     expiresAt: s.expiresAt,
+    deployUrl: s.deployUrl,
   };
 }
 
@@ -333,6 +336,18 @@ export function DirectorWorkspace({
     null,
   );
   const [caseLoaderOpen, setCaseLoaderOpen] = useState(false);
+  // 保存成功時のリンクモーダル。push が成功した瞬間に立ち上げ、
+  // GitHub commit URL と Vercel 本番 URL を案内する。
+  const [saveSuccess, setSaveSuccess] = useState<{
+    sessionId: string;
+    recordNumber: string;
+    partnerName: string;
+    commitSha?: string;
+    githubRepoUrl: string;
+    deployUrl?: string;
+    /** 保存して閉じる経由かどうか。表示メッセージを少し変える。 */
+    fromClose: boolean;
+  } | null>(null);
 
   const logSeqRef = useRef(0);
   // どの session に対して reconcile 済みか。useEffect が cases 全体に反応するので、
@@ -803,6 +818,7 @@ export function DirectorWorkspace({
         ok: boolean;
         message?: string;
         kind?: string;
+        commitSha?: string;
         typeCheckOutput?: string;
         typeCheckDurationMs?: number;
       };
@@ -823,6 +839,17 @@ export function DirectorWorkspace({
         lastResultMessage:
           data.message ?? (data.ok ? "保存しました" : "保存に失敗しました"),
       });
+      if (data.ok) {
+        setSaveSuccess({
+          sessionId: sid,
+          recordNumber: cur.loaded.recordNumber,
+          partnerName: cur.loaded.partnerName,
+          commitSha: data.commitSha,
+          githubRepoUrl: cur.loaded.githubRepoUrl,
+          deployUrl: cur.loaded.deployUrl,
+          fromClose: false,
+        });
+      }
     } catch (error) {
       patchCase(sid, {
         lastResultMessage:
@@ -897,6 +924,7 @@ export function DirectorWorkspace({
         : "案件を閉じています...",
     });
     try {
+      let savedCommitSha: string | undefined;
       if (saveFirst) {
         patchCase(sid, { lastResultMessage: "型チェック中... (最大 3 分)" });
         const saveResp = await fetch("/api/saves", {
@@ -908,6 +936,7 @@ export function DirectorWorkspace({
           ok: boolean;
           message?: string;
           kind?: string;
+          commitSha?: string;
           typeCheckOutput?: string;
         };
         if (!saveData.ok) {
@@ -932,6 +961,7 @@ export function DirectorWorkspace({
           });
           return;
         }
+        savedCommitSha = saveData.commitSha;
       }
       const closeResp = await fetch("/api/sessions/close", {
         method: "POST",
@@ -970,6 +1000,18 @@ export function DirectorWorkspace({
         const remaining = Object.keys(cases).filter((s) => s !== sid);
         return remaining[0] ?? null;
       });
+      if (saveFirst) {
+        // 案件を閉じた後でも保存先 (deploy URL / commit) を案内できるようモーダルを残す。
+        setSaveSuccess({
+          sessionId: sid,
+          recordNumber: cur.loaded.recordNumber,
+          partnerName: cur.loaded.partnerName,
+          commitSha: savedCommitSha,
+          githubRepoUrl: cur.loaded.githubRepoUrl,
+          deployUrl: cur.loaded.deployUrl,
+          fromClose: true,
+        });
+      }
     } catch (error) {
       patchCase(sid, {
         closing: false,
@@ -1101,6 +1143,13 @@ export function DirectorWorkspace({
         />
       )}
 
+      {saveSuccess && (
+        <SaveSuccessModal
+          info={saveSuccess}
+          onClose={() => setSaveSuccess(null)}
+        />
+      )}
+
       <div className="flex flex-1 min-h-0">
         {activeCase ? (
           <>
@@ -1219,6 +1268,140 @@ function CaseLoaderModal(props: {
             className="px-3 py-1.5 rounded-md border border-[#3a3a3f] bg-[#1b1b1d] text-xs text-[#a9a9b0] hover:border-[#55555c] hover:text-[#e8e8ea] transition"
           >
             キャンセル
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * GitHub HTTPS URL から `.git` を剥がす。
+ * 例: `https://github.com/foo/bar.git` → `https://github.com/foo/bar`
+ */
+function repoUrlBase(url: string): string {
+  return url.replace(/\.git$/i, "");
+}
+
+function SaveSuccessModal({
+  info,
+  onClose,
+}: {
+  info: {
+    recordNumber: string;
+    partnerName: string;
+    commitSha?: string;
+    githubRepoUrl: string;
+    deployUrl?: string;
+    fromClose: boolean;
+  };
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [onClose]);
+
+  const commitUrl = info.commitSha
+    ? `${repoUrlBase(info.githubRepoUrl)}/commit/${info.commitSha}`
+    : null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+      onClick={onClose}
+      role="presentation"
+    >
+      <div
+        className="w-[520px] max-w-[92vw] rounded-lg border border-teal-500/40 bg-[#1f1f22] p-5 shadow-[0_20px_50px_-10px_rgba(0,0,0,0.7)]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start gap-3">
+          <span
+            className="mt-0.5 inline-flex h-7 w-7 items-center justify-center rounded-full bg-teal-500/15 text-teal-300 text-base"
+            aria-hidden
+          >
+            ✓
+          </span>
+          <div className="flex-1 min-w-0">
+            <h2 className="text-base font-semibold text-[#f0f0f2] tracking-wide">
+              {info.fromClose
+                ? "保存して案件を閉じました"
+                : "GitHub に保存しました"}
+            </h2>
+            <p className="mt-1 text-xs text-[#a9a9b0] truncate">
+              案件 {info.recordNumber} ({info.partnerName})
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-4 space-y-3 text-sm">
+          {info.deployUrl ? (
+            <div>
+              <p className="text-[10px] font-medium uppercase tracking-wider text-[#70707a] mb-1">
+                Vercel 本番サイト
+              </p>
+              <a
+                href={info.deployUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-amber-300 hover:text-amber-200 underline decoration-amber-500/40 hover:decoration-amber-300 break-all"
+              >
+                {info.deployUrl}
+                <span aria-hidden className="text-[10px]">↗</span>
+              </a>
+              <p className="mt-1 text-[11px] text-[#70707a]">
+                デプロイ完了まで通常 1〜3 分かかります。反映が確認できるまで
+                少し時間を置いてアクセスしてください。
+              </p>
+            </div>
+          ) : (
+            <p className="text-[11px] text-[#a9a9b0] leading-relaxed">
+              本番デプロイ URL がスプレッドシートに登録されていません。
+              GitHub の commit から Vercel
+              ダッシュボード経由でデプロイ状況を確認してください。
+            </p>
+          )}
+
+          {commitUrl && info.commitSha && (
+            <div>
+              <p className="text-[10px] font-medium uppercase tracking-wider text-[#70707a] mb-1">
+                GitHub コミット
+              </p>
+              <a
+                href={commitUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-[#d0d0d4] hover:text-[#f0f0f2] underline decoration-[#3a3a3f] hover:decoration-[#a9a9b0] font-mono text-[12px]"
+                title={info.commitSha}
+              >
+                {info.commitSha.slice(0, 7)}
+                <span aria-hidden className="text-[10px]">↗</span>
+              </a>
+            </div>
+          )}
+        </div>
+
+        <div className="mt-5 flex justify-end gap-2">
+          {info.deployUrl && (
+            <a
+              href={info.deployUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center justify-center px-3 py-2 rounded-md bg-amber-500/90 text-[#0b0b0d] text-sm font-semibold hover:bg-amber-400 transition"
+            >
+              本番サイトを開く
+            </a>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-3 py-2 rounded-md border border-[#3a3a3f] bg-[#1b1b1d] text-sm text-[#a9a9b0] hover:border-[#55555c] hover:text-[#e8e8ea] transition"
+          >
+            閉じる
           </button>
         </div>
       </div>

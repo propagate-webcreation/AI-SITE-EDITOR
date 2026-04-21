@@ -10,6 +10,8 @@ export interface LoadedCase {
   githubRepoUrl: string;
   previewUrl: string;
   expiresAt: string;
+  /** Vercel 本番デプロイ URL。スプレッドシートに記載があれば。 */
+  deployUrl?: string;
 }
 
 interface CaseLoaderProps {
@@ -30,6 +32,7 @@ interface FetchCaseResponse {
     partnerName: string;
     contractPlan: string;
     githubRepoUrl: string;
+    deployUrl?: string;
   };
 }
 
@@ -64,6 +67,7 @@ export function CaseLoader({ onLoaded }: CaseLoaderProps) {
         partnerName: body.case.partnerName,
         contractPlan: body.case.contractPlan,
         githubRepoUrl: body.case.githubRepoUrl,
+        deployUrl: body.case.deployUrl,
       });
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {

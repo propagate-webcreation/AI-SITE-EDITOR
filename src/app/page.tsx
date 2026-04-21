@@ -1,3 +1,4 @@
+import path from "node:path";
 import { Sandbox } from "@vercel/sandbox";
 import {
   DirectorWorkspace,
@@ -8,8 +9,9 @@ import {
   createSupabaseServerClient,
 } from "@/infrastructure/supabase/supabaseClients";
 import { SupabaseSessionRepository } from "@/infrastructure/supabase/supabaseSessionRepository";
+import { GoogleSheetsClient } from "@/infrastructure/sheets/googleSheetsClient";
 import type { Session } from "@/domain/models";
-import type { SessionRepositoryPort } from "@/domain/ports";
+import type { SessionRepositoryPort, SpreadsheetPort } from "@/domain/ports";
 
 export default async function HomePage() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -35,6 +37,9 @@ export default async function HomePage() {
         serviceRoleKey,
       });
       const repo = new SupabaseSessionRepository(admin);
+      // セッション復元時に Vercel デプロイ URL も拾えるよう、可能であれば
+      // スプレッドシート参照も用意する。env が揃っていなければ undefined のまま。
+      const spreadsheet = buildSpreadsheetIfConfigured();
       const active = await repo.listActiveByDirector(data.user.id);
       // 全アクティブ案件を初期タブとして UI に渡す。
       // expired / dead sandbox はここで掃除して除外する。
@@ -48,6 +53,15 @@ export default async function HomePage() {
             await markSessionExpired(repo, s);
             return null;
           }
+          let deployUrl: string | undefined;
+          if (spreadsheet) {
+            try {
+              const rec = await spreadsheet.getCaseByRecordNumber(s.recordNumber);
+              deployUrl = rec?.deployUrl ?? undefined;
+            } catch {
+              /* best effort: シート参照に失敗しても hydration は止めない */
+            }
+          }
           return {
             sessionId: s.id,
             recordNumber: s.recordNumber,
@@ -56,6 +70,7 @@ export default async function HomePage() {
             githubRepoUrl: s.githubRepoUrl,
             previewUrl: s.previewUrl,
             expiresAt: s.expiresAt.toISOString(),
+            deployUrl,
           };
         }),
       );
@@ -88,6 +103,31 @@ async function isSandboxAlive(sandboxId: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Google Sheets 設定が揃っていればクライアントを返す。
+ * 設定不足時は null (= deployUrl 補完なしで進行)。
+ */
+function buildSpreadsheetIfConfigured(): SpreadsheetPort | null {
+  const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
+  const sheetName = process.env.GOOGLE_SHEETS_SHEET_NAME;
+  const credentialsJson = process.env.GOOGLE_SHEETS_CREDENTIALS_JSON;
+  const credentialsPath = process.env.GOOGLE_SHEETS_CREDENTIALS_PATH;
+  if (!spreadsheetId || !sheetName) return null;
+  if (!credentialsJson && !credentialsPath) return null;
+  try {
+    return new GoogleSheetsClient({
+      spreadsheetId,
+      sheetName,
+      credentialsJson,
+      credentialsPath: credentialsPath
+        ? path.resolve(process.cwd(), credentialsPath)
+        : undefined,
+    });
+  } catch {
+    return null;
   }
 }
 

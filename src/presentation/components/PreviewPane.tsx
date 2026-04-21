@@ -257,12 +257,30 @@ function ManualModal({ onClose }: { onClose: () => void }) {
           </button>
         </header>
         <div className="px-5 py-5 space-y-5 text-sm text-[#d0d0d4] leading-relaxed">
-          <ManualSection title="① 案件を開く">
-            <p>
-              ヘッダーの案件番号欄に案件レコード番号 (例: 12345)を入力し「開く」。
-              Sandbox が起動してプレビューが表示されます。既に開いている案件が
-              あれば、そのまま自動復元されます。
-            </p>
+          <ManualSection title="① 案件を開く / 複数同時に扱う">
+            <ul className="list-disc pl-5 space-y-1.5">
+              <li>
+                ヘッダー直下のタブバーから <Kbd>+ 新規案件</Kbd> を押し、
+                レコード番号 (例: 12345) を入力して「案件を開く」。
+                Sandbox の clone → npm install → dev server 起動を経て
+                プレビューに表示されます。
+              </li>
+              <li>
+                同じディレクターが <span className="text-amber-200">最大 5 案件まで</span>{" "}
+                同時に開けます。タブをクリックで切替。タブの右の{" "}
+                <Kbd>×</Kbd> でその案件だけ閉じられます。
+              </li>
+              <li>
+                タブ右に<span className="text-amber-200">点滅する黄色のドット</span>{" "}
+                が出ているタブは AI
+                修正・保存・dev server 再起動などの処理中。別タブを操作しても
+                その処理は止まらず、完了したらタブに反映されます。
+              </li>
+              <li>
+                ページをリロードすると、その時点で開いていた案件タブが
+                すべて自動復元されます (Sandbox が生きていれば)。
+              </li>
+            </ul>
           </ManualSection>
 
           <ManualSection title="② 修正指示を作る">
@@ -292,8 +310,15 @@ function ManualModal({ onClose }: { onClose: () => void }) {
             <p>
               <Kbd variant="primary">AI修正実行</Kbd>{" "}
               を押すと、溜まっている下書きを AI
-              が順次処理し、1指示ごとにコミットされます。実行中はログが
-              自動で開き、tool call の進行が確認できます。
+              が順次処理し、1 指示ごとに sandbox 内で
+              コミットされます。tool call の進行は画面下のログドロワーから
+              いつでも確認できます (自動展開はしないので、自分で開いてください)。
+            </p>
+            <p className="mt-2">
+              実行中に別の案件タブに切り替えたり、ブラウザを閉じても
+              <span className="text-amber-200">サーバ側の処理はそのまま継続</span>
+              します。次に開いた時に commit
+              済みのものは「適用済み」として復元されます。
             </p>
           </ManualSection>
 
@@ -310,24 +335,42 @@ function ManualModal({ onClose }: { onClose: () => void }) {
                 でその指示だけ個別に revert
                 コミットが作られます (他の指示はそのまま残ります)。
               </li>
+              <li>
+                AI が応答を完了する前に途切れた場合でも、編集内容が sandbox に
+                書き込まれていれば commit が試行されます。その場合は
+                summary の冒頭に「※ AI の応答が完了前に途切れましたが、
+                編集内容は commit に保存しました」と表示されます。
+              </li>
             </ul>
           </ManualSection>
 
           <ManualSection title="⑤ 保存 / 終了">
             <ul className="list-disc pl-5 space-y-1.5">
               <li>
-                <Kbd variant="teal">変更を保存</Kbd>{" "}
-                で、適用済みの修正全部を GitHub
-                に push。本番デプロイ (Vercel) が走ります。
+                <Kbd variant="teal">変更を保存</Kbd> を押すとまず{" "}
+                <span className="text-amber-200">型チェック (tsc --noEmit)</span>{" "}
+                が走ります (最大 3 分)。型エラーが残っていれば push
+                を中止し、エラー内容がログドロワーに出ます。
+                エラーをそのまま修正指示に貼って AI
+                に直してもらってから再保存してください。
               </li>
               <li>
-                <Kbd>案件を閉じる</Kbd> で Sandbox が停止。DB
+                型チェックを通れば GitHub に push。本番デプロイ (Vercel)
+                が自動で走ります。push 直後に
+                <span className="text-amber-200">本番サイト URL と
+                コミットへのリンク</span>
+                をポップアップで案内します (デプロイ反映には 1〜3 分)。
+              </li>
+              <li>
+                <Kbd>案件を閉じる</Kbd> (タブの ×) で Sandbox が停止。DB
                 の案件記録も消え、他のディレクターが同じ案件を開けるように
-                なります (GitHub のコミット履歴は残ります)。
+                なります。<span className="text-amber-200">これだけが
+                バックエンド処理を確実に止める唯一の操作</span>です
+                (GitHub のコミット履歴は残ります)。
               </li>
               <li>
-                保存せず閉じると、Sandbox 上の未 push の変更は失われます。
-                閉じる時に確認ダイアログが出ます。
+                保存せず閉じると、未 push の commit は失われます。
+                閉じる時に「保存して閉じる / 保存せず閉じる」の確認が出ます。
               </li>
             </ul>
           </ManualSection>
@@ -342,12 +385,19 @@ function ManualModal({ onClose }: { onClose: () => void }) {
               </li>
               <li>
                 ページを再読み込みしても下書き・セッション状態は保持されます
-                (localStorage + Sandbox 側の git log から復元)。
+                (localStorage + Sandbox 側の git log から復元)。タブも全部
+                戻ります。
               </li>
               <li>
-                AI 処理中にタブを閉じても、コミットされていれば次回復元時に
-                「適用済み」として拾われます。コミットが残っていない指示は
-                「失敗」になるので、同じ内容で再送信してください。
+                AI 処理中にタブを閉じても、commit されていれば次回復元時に
+                「適用済み」として拾われます。サーバ処理が完了する前に
+                リロードした場合は「失敗」になることがあるので、その時は
+                同じ内容で再送信してください。
+              </li>
+              <li>
+                「型チェック失敗で保存できない」が連続するときは、ログ
+                ドロワーに出ているファイル名と行番号を新しい修正指示に
+                コピペして AI に直させるのが早いです。
               </li>
             </ul>
           </ManualSection>
