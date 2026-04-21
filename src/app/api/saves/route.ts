@@ -66,6 +66,35 @@ export async function POST(request: Request): Promise<Response> {
     );
   }
 
+  // Step 1: 型チェックで Vercel デプロイが落ちる修正を事前に弾く。
+  // tsc が無い sandbox では skipped:true で素通しする。
+  let typeCheck: Awaited<ReturnType<typeof container.sandbox.typeCheck>>;
+  try {
+    typeCheck = await container.sandbox.typeCheck(session.sandboxId);
+  } catch (error) {
+    return NextResponse.json(
+      {
+        ok: false,
+        message: `型チェックの実行に失敗したため push を中止しました: ${error instanceof Error ? error.message : String(error)}`,
+      },
+      { status: 500 },
+    );
+  }
+  if (!typeCheck.ok) {
+    return NextResponse.json(
+      {
+        ok: false,
+        kind: "typecheck",
+        message:
+          "型エラーが残っているため push を中止しました。修正指示で直してから再度保存してください。",
+        typeCheckOutput: typeCheck.output,
+        typeCheckDurationMs: typeCheck.durationMs,
+      },
+      { status: 422 },
+    );
+  }
+
+  // Step 2: push
   try {
     const commitSha = await container.sandbox.pushAll({
       sandboxId: session.sandboxId,
@@ -77,6 +106,7 @@ export async function POST(request: Request): Promise<Response> {
       ok: true,
       message: `GitHub に保存しました (${commitSha.slice(0, 7)})。デプロイが自動で走ります。`,
       commitSha,
+      typeCheckSkipped: typeCheck.skipped,
     });
   } catch (error) {
     return NextResponse.json(

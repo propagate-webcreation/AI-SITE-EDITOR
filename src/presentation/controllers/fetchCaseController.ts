@@ -40,7 +40,15 @@ export type FetchCaseFailureCode =
   | "case-not-found"
   | "missing-repo-url"
   | "session-conflict"
-  | "sandbox-failed";
+  | "sandbox-failed"
+  | "max-cases-reached";
+
+/**
+ * 1 ディレクターが同時に開ける案件 (= active session) の上限。
+ * Vercel Sandbox の VM 課金が並列数に比例するため、ディレクター単位で上限を設けて
+ * 暴走を防ぐ。新規 open 時にこの数を超える場合は `max-cases-reached` で拒否する。
+ */
+export const MAX_ACTIVE_CASES_PER_DIRECTOR = 5;
 
 export interface FetchCaseFailure {
   ok: false;
@@ -97,6 +105,17 @@ export async function fetchCaseByRecordNumber(
       },
       case: toCaseResponse(caseRecord),
     };
+  }
+
+  // 新規セッション作成パス。ディレクター単位の同時 open 上限をここで弾く。
+  // 既に開いている案件 (occupied && directorId match) は早期 return しているので
+  // ここに来る = 新しい案件を増やそうとしている = カウント +1 になるケース。
+  const myActive = await deps.sessions.listActiveByDirector(deps.directorId);
+  if (myActive.length >= MAX_ACTIVE_CASES_PER_DIRECTOR) {
+    return failure(
+      "max-cases-reached",
+      `同時に開ける案件は最大 ${MAX_ACTIVE_CASES_PER_DIRECTOR} 件までです。先に古い案件を閉じてから再度お試しください。`,
+    );
   }
 
   let sandboxInfo;

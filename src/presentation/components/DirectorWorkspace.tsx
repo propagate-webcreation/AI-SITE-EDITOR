@@ -14,6 +14,14 @@ import {
 import { CaseLoader, type LoadedCase } from "./CaseLoader";
 import { LogDrawer, type LogEntry } from "./LogDrawer";
 
+/**
+ * 1 ディレクターが同時に開けるタブ (= active session) の上限。
+ * Vercel Sandbox の VM 課金が並列数に比例するため、サーバ側
+ * (`fetchCaseController.MAX_ACTIVE_CASES_PER_DIRECTOR`) と同じ値を UI 側でも
+ * 強制してタブ追加ボタンを早めに無効化する。
+ */
+const MAX_OPEN_CASES = 5;
+
 export interface InitialSessionSummary {
   sessionId: string;
   recordNumber: string;
@@ -26,7 +34,7 @@ export interface InitialSessionSummary {
 
 interface DirectorWorkspaceProps {
   directorEmail: string | null;
-  initialSession: InitialSessionSummary | null;
+  initialSessions: InitialSessionSummary[];
 }
 
 const EMPTY_STRING_ARRAY: readonly string[] = Object.freeze([]);
@@ -89,6 +97,27 @@ type StreamEvent =
       applications: ApiApplication[];
       durationSec: number;
     };
+
+/**
+ * 1 つの開いている案件タブに紐付く全 UI 状態。
+ * タブ切替は `activeSessionId` を変えるだけで、各タブの fetch / stream は
+ * バックグラウンドで動き続けるため、案件ごとに分離して持つ。
+ */
+interface CaseState {
+  loaded: LoadedCase;
+  items: ChatItem[];
+  pendingSelectors: ChatSelector[];
+  running: boolean;
+  saving: boolean;
+  closing: boolean;
+  selectMode: boolean;
+  revertingItemId: string | null;
+  restartingDevServer: boolean;
+  activeHighlightItemId: string | null;
+  logEntries: LogEntry[];
+  previewKey: number;
+  lastResultMessage: string | null;
+}
 
 function shortInstructionId(id: string): string {
   // "ins-1756781234-abc" → "abc"
@@ -245,154 +274,240 @@ function mergeFromServer(
   return out;
 }
 
+function loadedFromInitial(s: InitialSessionSummary): LoadedCase {
+  return {
+    sessionId: s.sessionId,
+    recordNumber: s.recordNumber,
+    partnerName: s.partnerName,
+    contractPlan: s.contractPlan,
+    githubRepoUrl: s.githubRepoUrl,
+    previewUrl: s.previewUrl,
+    expiresAt: s.expiresAt,
+  };
+}
+
+function makeInitialCaseState(
+  loaded: LoadedCase,
+  persisted: PersistedWork | null,
+  message: string | null,
+): CaseState {
+  return {
+    loaded,
+    items: persisted?.items ?? [],
+    pendingSelectors: persisted?.pendingSelectors ?? [],
+    running: false,
+    saving: false,
+    closing: false,
+    selectMode: false,
+    revertingItemId: null,
+    restartingDevServer: false,
+    activeHighlightItemId: null,
+    logEntries: [],
+    previewKey: 0,
+    lastResultMessage: message,
+  };
+}
+
 export function DirectorWorkspace({
   directorEmail,
-  initialSession,
+  initialSessions,
 }: DirectorWorkspaceProps) {
-  const [loadedCase, setLoadedCase] = useState<LoadedCase | null>(() => {
-    if (!initialSession) return null;
-    return {
-      sessionId: initialSession.sessionId,
-      recordNumber: initialSession.recordNumber,
-      partnerName: initialSession.partnerName,
-      contractPlan: initialSession.contractPlan,
-      githubRepoUrl: initialSession.githubRepoUrl,
-      previewUrl: initialSession.previewUrl,
-      expiresAt: initialSession.expiresAt,
-    };
-  });
-
-  const initialWork = useMemo<PersistedWork>(() => {
-    if (typeof window === "undefined" || !initialSession) {
-      return { items: [], pendingSelectors: [] };
+  const [cases, setCases] = useState<Record<string, CaseState>>(() => {
+    const out: Record<string, CaseState> = {};
+    for (const s of initialSessions) {
+      const loaded = loadedFromInitial(s);
+      const persisted =
+        typeof window === "undefined" ? null : loadPersistedWork(s.sessionId);
+      out[s.sessionId] = makeInitialCaseState(
+        loaded,
+        persisted,
+        `案件 ${s.recordNumber} (${s.partnerName}) を復元しました`,
+      );
     }
-    return (
-      loadPersistedWork(initialSession.sessionId) ?? {
-        items: [],
-        pendingSelectors: [],
-      }
-    );
-  }, [initialSession]);
+    return out;
+  });
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(
+    initialSessions[0]?.sessionId ?? null,
+  );
+  const [closeTargetSessionId, setCloseTargetSessionId] = useState<string | null>(
+    null,
+  );
+  const [caseLoaderOpen, setCaseLoaderOpen] = useState(false);
 
-  const [items, setItems] = useState<ChatItem[]>(initialWork.items);
-  const [pendingSelectors, setPendingSelectors] = useState<ChatSelector[]>(
-    initialWork.pendingSelectors,
-  );
-  const [running, setRunning] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [closing, setClosing] = useState(false);
-  const [closeModalOpen, setCloseModalOpen] = useState(false);
-  const [selectMode, setSelectMode] = useState(false);
-  const [revertingItemId, setRevertingItemId] = useState<string | null>(null);
-  const [restartingDevServer, setRestartingDevServer] = useState(false);
-  const [activeHighlightItemId, setActiveHighlightItemId] = useState<
-    string | null
-  >(null);
-  const [lastResultMessage, setLastResultMessage] = useState<string | null>(
-    initialSession
-      ? `案件 ${initialSession.recordNumber} (${initialSession.partnerName}) を復元しました`
-      : null,
-  );
-  const previewKeyRef = useRef(0);
-  const [previewKey, setPreviewKey] = useState(0);
-  const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const logSeqRef = useRef(0);
-  const pushLog = useMemo(
-    () => (entry: Omit<LogEntry, "id" | "ts">) => {
-      logSeqRef.current += 1;
-      setLogEntries((prev) => [
-        ...prev,
-        { ...entry, id: `log-${logSeqRef.current}`, ts: Date.now() },
-      ]);
-    },
-    [],
-  );
+  // どの session に対して reconcile 済みか。useEffect が cases 全体に反応するので、
+  // 同じ session に対して何度も reconcile を撃たないよう Set で覚える。
+  const reconciledRef = useRef<Set<string>>(new Set());
 
-  // ページリロード時の reconcile: Sandbox の git log を見て、
-  // localStorage で submitted / running のまま止まっている item を
-  // 実際に commit された状態 (applied + commitSha) に昇格させる。
-  // あるいは revert commit が見つかれば reverted に更新。
-  useEffect(() => {
-    if (!loadedCase) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const resp = await fetch(
-          `/api/sessions/reconcile?sessionId=${encodeURIComponent(loadedCase.sessionId)}`,
-        );
-        if (!resp.ok) return;
-        const body = (await resp.json()) as {
-          ok: boolean;
-          commits?: {
-            sha: string;
-            instructionId: string;
-            kind: "apply" | "revert";
-            targetSha?: string;
-            committedAt: number;
-          }[];
-          hasDirty?: boolean;
-        };
-        if (!body.ok || cancelled) return;
-        const commits = body.commits ?? [];
-        setItems((prev) => reconcileFromGitLog(prev, commits));
-      } catch {
-        /* noop: localStorage の状態のまま */
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [loadedCase]);
-
-  useEffect(() => {
-    if (!loadedCase) return;
-    savePersistedWork(loadedCase.sessionId, {
-      items,
-      pendingSelectors,
+  // ---- ヘルパ ----
+  function patchCase(
+    sid: string,
+    patch: Partial<CaseState> | ((cur: CaseState) => Partial<CaseState>),
+  ): void {
+    setCases((prev) => {
+      const cur = prev[sid];
+      if (!cur) return prev;
+      const computed = typeof patch === "function" ? patch(cur) : patch;
+      return { ...prev, [sid]: { ...cur, ...computed } };
     });
-  }, [loadedCase, items, pendingSelectors]);
+  }
 
-  const hasAppliedItems = useMemo(
-    () => items.some((it) => it.status === "applied"),
-    [items],
-  );
+  function updateCaseItems(
+    sid: string,
+    updater: (prev: ChatItem[]) => ChatItem[],
+  ): void {
+    setCases((prev) => {
+      const cur = prev[sid];
+      if (!cur) return prev;
+      return { ...prev, [sid]: { ...cur, items: updater(cur.items) } };
+    });
+  }
 
-  // ハイライト対象の CSS selector 配列。active item が無い / applied でない / selector 無しなら空。
+  function pushLog(sid: string, entry: Omit<LogEntry, "id" | "ts">): void {
+    logSeqRef.current += 1;
+    const full: LogEntry = {
+      ...entry,
+      id: `log-${logSeqRef.current}`,
+      ts: Date.now(),
+    };
+    setCases((prev) => {
+      const cur = prev[sid];
+      if (!cur) return prev;
+      return {
+        ...prev,
+        [sid]: { ...cur, logEntries: [...cur.logEntries, full] },
+      };
+    });
+  }
+
+  function bumpPreview(sid: string): void {
+    patchCase(sid, (cur) => ({ previewKey: cur.previewKey + 1 }));
+  }
+
+  // ---- 副作用: 各 case が初登場した瞬間に 1 回だけ reconcile を撃つ ----
+  useEffect(() => {
+    for (const sid of Object.keys(cases)) {
+      if (reconciledRef.current.has(sid)) continue;
+      reconciledRef.current.add(sid);
+      (async () => {
+        try {
+          const resp = await fetch(
+            `/api/sessions/reconcile?sessionId=${encodeURIComponent(sid)}`,
+          );
+          if (!resp.ok) return;
+          const body = (await resp.json()) as {
+            ok: boolean;
+            commits?: {
+              sha: string;
+              instructionId: string;
+              kind: "apply" | "revert";
+              targetSha?: string;
+              committedAt: number;
+            }[];
+            hasDirty?: boolean;
+          };
+          if (!body.ok) return;
+          updateCaseItems(sid, (prev) =>
+            reconcileFromGitLog(prev, body.commits ?? []),
+          );
+        } catch {
+          /* noop: localStorage の状態のまま */
+        }
+      })();
+    }
+    // close されたら ref からも掃除
+    for (const sid of Array.from(reconciledRef.current)) {
+      if (!cases[sid]) reconciledRef.current.delete(sid);
+    }
+  }, [cases]);
+
+  // ---- 副作用: items / pendingSelectors の localStorage 永続化 ----
+  useEffect(() => {
+    for (const [sid, c] of Object.entries(cases)) {
+      savePersistedWork(sid, {
+        items: c.items,
+        pendingSelectors: c.pendingSelectors,
+      });
+    }
+  }, [cases]);
+
+  // ---- 副作用: ハイライト中の item が applied 以外になったら自動解除 ----
+  useEffect(() => {
+    setCases((prev) => {
+      let changed = false;
+      const next: Record<string, CaseState> = {};
+      for (const [sid, c] of Object.entries(prev)) {
+        if (c.activeHighlightItemId) {
+          const item = c.items.find(
+            (it) => it.id === c.activeHighlightItemId,
+          );
+          if (!item || item.status !== "applied") {
+            next[sid] = { ...c, activeHighlightItemId: null };
+            changed = true;
+            continue;
+          }
+        }
+        next[sid] = c;
+      }
+      return changed ? next : prev;
+    });
+  }, [cases]);
+
+  const activeCase = activeSessionId ? cases[activeSessionId] ?? null : null;
+
+  // ---- アクティブタブ由来の derived ----
   const highlightSelectors = useMemo<readonly string[]>(() => {
-    if (!activeHighlightItemId) return EMPTY_STRING_ARRAY;
-    const item = items.find((it) => it.id === activeHighlightItemId);
+    if (!activeCase || !activeCase.activeHighlightItemId)
+      return EMPTY_STRING_ARRAY;
+    const item = activeCase.items.find(
+      (it) => it.id === activeCase.activeHighlightItemId,
+    );
     if (!item || item.status !== "applied") return EMPTY_STRING_ARRAY;
     return item.selectors.map((s) => s.selector);
-  }, [activeHighlightItemId, items]);
+  }, [activeCase]);
 
-  // active item が applied 以外になったら自動で解除 (revert 直後など)
-  useEffect(() => {
-    if (!activeHighlightItemId) return;
-    const item = items.find((it) => it.id === activeHighlightItemId);
-    if (!item || item.status !== "applied") {
-      setActiveHighlightItemId(null);
-    }
-  }, [activeHighlightItemId, items]);
+  const caseCount = Object.keys(cases).length;
+  const canOpenMore = caseCount < MAX_OPEN_CASES;
+
+  // ---- ハンドラ群 ----
 
   function handleCaseLoaded(loaded: LoadedCase): void {
-    setLoadedCase(loaded);
-    setItems([]);
-    setPendingSelectors([]);
-    setLastResultMessage(
-      `案件 ${loaded.recordNumber} (${loaded.partnerName}) を開きました`,
-    );
-    previewKeyRef.current += 1;
-    setPreviewKey(previewKeyRef.current);
+    setCaseLoaderOpen(false);
+    if (cases[loaded.sessionId]) {
+      // 同じ案件が既に開かれていたらそれをアクティブにするだけ。
+      setActiveSessionId(loaded.sessionId);
+      return;
+    }
+    if (!canOpenMore) return;
+    const persisted =
+      typeof window === "undefined"
+        ? null
+        : loadPersistedWork(loaded.sessionId);
+    setCases((prev) => ({
+      ...prev,
+      [loaded.sessionId]: makeInitialCaseState(
+        loaded,
+        persisted,
+        `案件 ${loaded.recordNumber} (${loaded.partnerName}) を開きました`,
+      ),
+    }));
+    setActiveSessionId(loaded.sessionId);
   }
 
   function handleElementSelected(sel: PreviewSelectorPayload): void {
-    setPendingSelectors((prev) => {
-      if (prev.some((p) => p.selector === sel.selector)) return prev;
-      return [...prev, sel];
+    if (!activeSessionId) return;
+    patchCase(activeSessionId, (cur) => {
+      if (cur.pendingSelectors.some((p) => p.selector === sel.selector))
+        return {};
+      return { pendingSelectors: [...cur.pendingSelectors, sel] };
     });
   }
+
   function handleRemovePendingSelector(index: number): void {
-    setPendingSelectors((prev) => prev.filter((_, i) => i !== index));
+    if (!activeSessionId) return;
+    patchCase(activeSessionId, (cur) => ({
+      pendingSelectors: cur.pendingSelectors.filter((_, i) => i !== index),
+    }));
   }
 
   async function handleSubmitInstruction(params: {
@@ -400,6 +515,8 @@ export function DirectorWorkspace({
     attachments: File[];
     isGlobal: boolean;
   }): Promise<void> {
+    if (!activeSessionId) return;
+    const sid = activeSessionId;
     const id = `ins-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const encoded = await Promise.all(
       params.attachments.map(async (f) => ({
@@ -409,33 +526,121 @@ export function DirectorWorkspace({
         base64: await fileToBase64(f),
       })),
     );
-    setItems((prev) => [
-      ...prev,
-      {
-        id,
-        comment: params.comment,
-        attachments: encoded,
-        selectors: params.isGlobal ? [] : pendingSelectors,
-        isGlobal: params.isGlobal,
-        status: "draft",
-      },
-    ]);
-    if (!params.isGlobal) setPendingSelectors([]);
+    patchCase(sid, (cur) => ({
+      items: [
+        ...cur.items,
+        {
+          id,
+          comment: params.comment,
+          attachments: encoded,
+          selectors: params.isGlobal ? [] : cur.pendingSelectors,
+          isGlobal: params.isGlobal,
+          status: "draft",
+        },
+      ],
+      pendingSelectors: params.isGlobal ? cur.pendingSelectors : [],
+    }));
+  }
+
+  function handleDeleteDraft(itemId: string): void {
+    if (!activeSessionId) return;
+    updateCaseItems(activeSessionId, (prev) =>
+      prev.filter((it) => !(it.id === itemId && it.status === "draft")),
+    );
+  }
+
+  function handleStreamEvent(sid: string, event: StreamEvent): void {
+    if (event.kind === "phase") {
+      const phaseLabel =
+        event.phase === "prepare"
+          ? `準備完了 (通常 ${event.regularCount} / 全体 ${event.globalCount})`
+          : event.phase === "regular"
+            ? `通常指示を並列実行 (${event.regularCount} 件)`
+            : event.phase === "global"
+              ? `全体指示を順次実行 (${event.globalCount} 件)`
+              : "完了";
+      pushLog(sid, { kind: "phase", phase: event.phase, headline: phaseLabel });
+    } else if (event.kind === "instruction") {
+      const statusLabel = {
+        queued: "キュー追加",
+        running: "実行開始",
+        applied: "✓ 反映済み",
+        failed: "× 失敗",
+        reverted: "元に戻した",
+        unclear: "判定不可",
+      }[event.status];
+      pushLog(sid, {
+        kind: "instruction",
+        instructionId: event.instructionId,
+        headline: `${shortInstructionId(event.instructionId)}${event.isGlobal ? " [全体]" : ""}  ${statusLabel}`,
+        detail: event.commitSha
+          ? event.commitSha.slice(0, 7)
+          : event.message?.slice(0, 120),
+        error: event.status === "failed",
+      });
+      // 実 item の status も即座に更新。result イベントの到着を待たない。
+      // 途中でストリームが切れても UI が「AI 処理中」で固まらないようにする。
+      const terminalStatus =
+        event.status === "applied" ||
+        event.status === "failed" ||
+        event.status === "unclear" ||
+        event.status === "reverted";
+      if (terminalStatus) {
+        updateCaseItems(sid, (prev) =>
+          prev.map((item) => {
+            if (item.id !== event.instructionId) return item;
+            const isFailed =
+              event.status === "failed" || event.status === "unclear";
+            return {
+              ...item,
+              status: event.status as ChatItemStatus,
+              commitSha: event.commitSha ?? item.commitSha,
+              errorMessage: isFailed
+                ? event.message ?? item.errorMessage
+                : item.errorMessage,
+            };
+          }),
+        );
+      }
+    } else if (event.kind === "toolCall") {
+      pushLog(sid, {
+        kind: "toolCall",
+        instructionId: event.instructionId,
+        headline: `${event.name} ${event.argsSummary}`,
+        detail: `#${event.iteration} ${event.success ? "ok" : "fail"}`,
+        error: !event.success,
+      });
+    } else if (event.kind === "log") {
+      pushLog(sid, {
+        kind: "log",
+        headline: event.message,
+        error: event.level === "error",
+      });
+    } else if (event.kind === "result") {
+      pushLog(sid, {
+        kind: "result",
+        headline: event.message,
+        detail: `${event.durationSec.toFixed(1)}s / ${event.applications.length} 件`,
+        error: !event.ok,
+      });
+    }
   }
 
   async function handleRun(): Promise<void> {
-    if (!loadedCase || running || saving) return;
-    const drafts = items.filter((it) => it.status === "draft");
+    if (!activeSessionId) return;
+    const sid = activeSessionId;
+    const cur = cases[sid];
+    if (!cur || cur.running || cur.saving) return;
+    const drafts = cur.items.filter((it) => it.status === "draft");
     if (drafts.length === 0) return;
 
-    setRunning(true);
-    setLastResultMessage(null);
-    setLogEntries([]);
-    setItems((prev) =>
+    patchCase(sid, { running: true, lastResultMessage: null, logEntries: [] });
+    updateCaseItems(sid, (prev) =>
       prev.map((it) =>
         it.status === "draft" ? { ...it, status: "submitted" as const } : it,
       ),
     );
+
     let finalResult: {
       ok: boolean;
       message?: string;
@@ -446,7 +651,7 @@ export function DirectorWorkspace({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sessionId: loadedCase.sessionId,
+          sessionId: cur.loaded.sessionId,
           instructions: drafts.map((it) => ({
             id: it.id,
             comment: it.comment,
@@ -467,7 +672,6 @@ export function DirectorWorkspace({
       });
 
       if (!resp.ok || !resp.body) {
-        // レガシー JSON フォールバック。5xx でも JSON が返ることがある。
         const fallback = (await resp.json().catch(() => null)) as {
           ok?: boolean;
           message?: string;
@@ -489,7 +693,7 @@ export function DirectorWorkspace({
           if (!trimmed) continue;
           try {
             const event = JSON.parse(trimmed) as StreamEvent;
-            handleStreamEvent(event);
+            handleStreamEvent(sid, event);
             if (event.kind === "result") {
               finalResult = {
                 ok: event.ok,
@@ -504,122 +708,47 @@ export function DirectorWorkspace({
       }
 
       if (finalResult && Array.isArray(finalResult.applications)) {
-        setItems((prev) => mergeFromServer(prev, finalResult!.applications!));
+        updateCaseItems(sid, (prev) =>
+          mergeFromServer(prev, finalResult!.applications!),
+        );
       }
-      setLastResultMessage(
-        finalResult?.message ??
+      patchCase(sid, {
+        lastResultMessage:
+          finalResult?.message ??
           (finalResult?.ok ? "修正が完了しました" : "修正に失敗しました"),
-      );
-      previewKeyRef.current += 1;
-      setPreviewKey(previewKeyRef.current);
+      });
+      bumpPreview(sid);
     } catch (error) {
-      setLastResultMessage(
-        error instanceof Error ? error.message : "通信エラーが発生しました",
-      );
-      setItems((prev) =>
+      patchCase(sid, {
+        lastResultMessage:
+          error instanceof Error ? error.message : "通信エラーが発生しました",
+      });
+      updateCaseItems(sid, (prev) =>
         prev.map((it) =>
-          it.status === "submitted" ? { ...it, status: "failed" as const } : it,
+          it.status === "submitted"
+            ? { ...it, status: "failed" as const }
+            : it,
         ),
       );
     } finally {
-      setRunning(false);
+      patchCase(sid, { running: false });
     }
-  }
-
-  function handleStreamEvent(event: StreamEvent): void {
-    if (event.kind === "phase") {
-      const phaseLabel =
-        event.phase === "prepare"
-          ? `準備完了 (通常 ${event.regularCount} / 全体 ${event.globalCount})`
-          : event.phase === "regular"
-            ? `通常指示を並列実行 (${event.regularCount} 件)`
-            : event.phase === "global"
-              ? `全体指示を順次実行 (${event.globalCount} 件)`
-              : "完了";
-      pushLog({ kind: "phase", phase: event.phase, headline: phaseLabel });
-    } else if (event.kind === "instruction") {
-      const statusLabel = {
-        queued: "キュー追加",
-        running: "実行開始",
-        applied: "✓ 反映済み",
-        failed: "× 失敗",
-        reverted: "元に戻した",
-        unclear: "判定不可",
-      }[event.status];
-      pushLog({
-        kind: "instruction",
-        instructionId: event.instructionId,
-        headline: `${shortInstructionId(event.instructionId)}${event.isGlobal ? " [全体]" : ""}  ${statusLabel}`,
-        detail: event.commitSha
-          ? event.commitSha.slice(0, 7)
-          : event.message?.slice(0, 120),
-        error: event.status === "failed",
-      });
-      // 実 item の status も即座に更新。result イベントの到着を待たない。
-      // 途中でストリームが切れても UI が「AI 処理中」で固まらないようにする。
-      const terminalStatus =
-        event.status === "applied" ||
-        event.status === "failed" ||
-        event.status === "unclear" ||
-        event.status === "reverted";
-      if (terminalStatus) {
-        setItems((prev) =>
-          prev.map((item) => {
-            if (item.id !== event.instructionId) return item;
-            const isFailed =
-              event.status === "failed" || event.status === "unclear";
-            return {
-              ...item,
-              status: event.status as ChatItemStatus,
-              commitSha: event.commitSha ?? item.commitSha,
-              errorMessage: isFailed
-                ? event.message ?? item.errorMessage
-                : item.errorMessage,
-            };
-          }),
-        );
-      }
-    } else if (event.kind === "toolCall") {
-      pushLog({
-        kind: "toolCall",
-        instructionId: event.instructionId,
-        headline: `${event.name} ${event.argsSummary}`,
-        detail: `#${event.iteration} ${event.success ? "ok" : "fail"}`,
-        error: !event.success,
-      });
-    } else if (event.kind === "log") {
-      pushLog({
-        kind: "log",
-        headline: event.message,
-        error: event.level === "error",
-      });
-    } else if (event.kind === "result") {
-      pushLog({
-        kind: "result",
-        headline: event.message,
-        detail: `${event.durationSec.toFixed(1)}s / ${event.applications.length} 件`,
-        error: !event.ok,
-      });
-    }
-  }
-
-  function handleDeleteDraft(itemId: string): void {
-    setItems((prev) =>
-      prev.filter((it) => !(it.id === itemId && it.status === "draft")),
-    );
   }
 
   async function handleRevert(itemId: string): Promise<void> {
-    if (!loadedCase || revertingItemId) return;
-    const target = items.find((it) => it.id === itemId);
+    if (!activeSessionId) return;
+    const sid = activeSessionId;
+    const cur = cases[sid];
+    if (!cur || cur.revertingItemId) return;
+    const target = cur.items.find((it) => it.id === itemId);
     if (!target?.commitSha) return;
-    setRevertingItemId(itemId);
+    patchCase(sid, { revertingItemId: itemId });
     try {
       const resp = await fetch("/api/instructions/revert", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sessionId: loadedCase.sessionId,
+          sessionId: cur.loaded.sessionId,
           instructionId: target.id,
           commitSha: target.commitSha,
           comment: target.comment,
@@ -631,46 +760,76 @@ export function DirectorWorkspace({
         revertCommitSha?: string;
       };
       if (data.ok) {
-        setItems((prev) =>
+        updateCaseItems(sid, (prev) =>
           prev.map((it) =>
             it.id === itemId ? { ...it, status: "reverted" as const } : it,
           ),
         );
-        setLastResultMessage(data.message ?? "指示を元に戻しました");
-        previewKeyRef.current += 1;
-        setPreviewKey(previewKeyRef.current);
+        patchCase(sid, {
+          lastResultMessage: data.message ?? "指示を元に戻しました",
+        });
+        bumpPreview(sid);
       } else {
-        setLastResultMessage(data.message ?? "ロールバックに失敗しました");
+        patchCase(sid, {
+          lastResultMessage: data.message ?? "ロールバックに失敗しました",
+        });
       }
     } catch (error) {
-      setLastResultMessage(
-        error instanceof Error ? error.message : "通信エラーが発生しました",
-      );
+      patchCase(sid, {
+        lastResultMessage:
+          error instanceof Error ? error.message : "通信エラーが発生しました",
+      });
     } finally {
-      setRevertingItemId(null);
+      patchCase(sid, { revertingItemId: null });
     }
   }
 
   async function handleSave(): Promise<void> {
-    if (!loadedCase || saving || running) return;
-    setSaving(true);
-    setLastResultMessage("GitHub に保存中...");
+    if (!activeSessionId) return;
+    const sid = activeSessionId;
+    const cur = cases[sid];
+    if (!cur || cur.saving || cur.running) return;
+    patchCase(sid, {
+      saving: true,
+      lastResultMessage: "型チェック中... (最大 3 分)",
+    });
     try {
       const resp = await fetch("/api/saves", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: loadedCase.sessionId }),
+        body: JSON.stringify({ sessionId: cur.loaded.sessionId }),
       });
-      const data = (await resp.json()) as { ok: boolean; message?: string };
-      setLastResultMessage(
-        data.message ?? (data.ok ? "保存しました" : "保存に失敗しました"),
-      );
+      const data = (await resp.json()) as {
+        ok: boolean;
+        message?: string;
+        kind?: string;
+        typeCheckOutput?: string;
+        typeCheckDurationMs?: number;
+      };
+      if (!data.ok && data.kind === "typecheck" && data.typeCheckOutput) {
+        const head = data.typeCheckOutput
+          .split("\n")
+          .filter((l) => l.trim().length > 0)
+          .slice(0, 12)
+          .join("\n");
+        pushLog(sid, {
+          kind: "log",
+          headline: "型チェック失敗 — push を中止",
+          detail: head,
+          error: true,
+        });
+      }
+      patchCase(sid, {
+        lastResultMessage:
+          data.message ?? (data.ok ? "保存しました" : "保存に失敗しました"),
+      });
     } catch (error) {
-      setLastResultMessage(
-        error instanceof Error ? error.message : "通信エラーが発生しました",
-      );
+      patchCase(sid, {
+        lastResultMessage:
+          error instanceof Error ? error.message : "通信エラーが発生しました",
+      });
     } finally {
-      setSaving(false);
+      patchCase(sid, { saving: false });
     }
   }
 
@@ -682,104 +841,150 @@ export function DirectorWorkspace({
     }
   }
 
-  async function handleRestartDevServer(): Promise<void> {
-    if (!loadedCase || restartingDevServer) return;
-    setRestartingDevServer(true);
-    setLastResultMessage("開発サーバーを再起動中... (最大 3 分)");
+  async function handleRestartDevServer(sid: string): Promise<void> {
+    const cur = cases[sid];
+    if (!cur || cur.restartingDevServer) return;
+    patchCase(sid, {
+      restartingDevServer: true,
+      lastResultMessage: "開発サーバーを再起動中... (最大 3 分)",
+    });
     try {
       const resp = await fetch("/api/sessions/restart-preview", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: loadedCase.sessionId }),
+        body: JSON.stringify({ sessionId: cur.loaded.sessionId }),
       });
       const data = (await resp.json()) as { ok: boolean; message?: string };
       if (data.ok) {
-        previewKeyRef.current += 1;
-        setPreviewKey(previewKeyRef.current);
-        setLastResultMessage(
-          data.message ?? "開発サーバーを再起動しました。",
-        );
+        bumpPreview(sid);
+        patchCase(sid, {
+          lastResultMessage: data.message ?? "開発サーバーを再起動しました。",
+        });
       } else {
-        setLastResultMessage(
-          data.message ?? "開発サーバーの再起動に失敗しました。",
-        );
+        patchCase(sid, {
+          lastResultMessage:
+            data.message ?? "開発サーバーの再起動に失敗しました。",
+        });
       }
     } catch (error) {
-      setLastResultMessage(
-        error instanceof Error ? error.message : "通信エラーが発生しました",
-      );
+      patchCase(sid, {
+        lastResultMessage:
+          error instanceof Error ? error.message : "通信エラーが発生しました",
+      });
     } finally {
-      setRestartingDevServer(false);
+      patchCase(sid, { restartingDevServer: false });
     }
   }
 
-  async function handleCloseCase(saveFirst: boolean): Promise<void> {
-    if (!loadedCase || closing) return;
-    setCloseModalOpen(false);
-    setClosing(true);
-    setLastResultMessage(
-      saveFirst ? "変更を保存してから閉じています..." : "案件を閉じています...",
-    );
+  /**
+   * 案件タブを閉じる。
+   * - saveFirst=true: 型チェック → push → close
+   * - saveFirst=false: 直接 close (Sandbox 破棄、変更喪失)
+   *
+   * close が成功したらタブを cases から外し、別タブにフォーカスを移す。
+   */
+  async function handleCloseCase(
+    sid: string,
+    saveFirst: boolean,
+  ): Promise<void> {
+    const cur = cases[sid];
+    if (!cur || cur.closing) return;
+    setCloseTargetSessionId(null);
+    patchCase(sid, {
+      closing: true,
+      lastResultMessage: saveFirst
+        ? "変更を保存してから閉じています..."
+        : "案件を閉じています...",
+    });
     try {
       if (saveFirst) {
+        patchCase(sid, { lastResultMessage: "型チェック中... (最大 3 分)" });
         const saveResp = await fetch("/api/saves", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: loadedCase.sessionId }),
+          body: JSON.stringify({ sessionId: cur.loaded.sessionId }),
         });
         const saveData = (await saveResp.json()) as {
           ok: boolean;
           message?: string;
+          kind?: string;
+          typeCheckOutput?: string;
         };
         if (!saveData.ok) {
-          setLastResultMessage(
-            saveData.message ?? "保存に失敗したため、案件は開いたままにしました。",
-          );
+          if (saveData.kind === "typecheck" && saveData.typeCheckOutput) {
+            const head = saveData.typeCheckOutput
+              .split("\n")
+              .filter((l) => l.trim().length > 0)
+              .slice(0, 12)
+              .join("\n");
+            pushLog(sid, {
+              kind: "log",
+              headline: "型チェック失敗 — push を中止",
+              detail: head,
+              error: true,
+            });
+          }
+          patchCase(sid, {
+            closing: false,
+            lastResultMessage:
+              saveData.message ??
+              "保存に失敗したため、案件は開いたままにしました。",
+          });
           return;
         }
       }
       const closeResp = await fetch("/api/sessions/close", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sessionId: loadedCase.sessionId }),
+        body: JSON.stringify({ sessionId: cur.loaded.sessionId }),
       });
       const closeData = (await closeResp.json()) as {
         ok: boolean;
         message?: string;
       };
       if (!closeData.ok) {
-        setLastResultMessage(closeData.message ?? "案件のクローズに失敗しました。");
+        patchCase(sid, {
+          closing: false,
+          lastResultMessage:
+            closeData.message ?? "案件のクローズに失敗しました。",
+        });
         return;
       }
+      // localStorage 掃除 + cases から削除 + 別タブへフォーカス
       if (typeof window !== "undefined") {
         try {
-          window.localStorage.removeItem(workStorageKey(loadedCase.sessionId));
+          window.localStorage.removeItem(workStorageKey(sid));
         } catch {
           /* ignore */
         }
       }
-      setLoadedCase(null);
-      setItems([]);
-      setPendingSelectors([]);
-      previewKeyRef.current += 1;
-      setPreviewKey(previewKeyRef.current);
-      setLastResultMessage(
-        saveFirst
-          ? "変更を GitHub に保存してから案件を閉じました。"
-          : "案件を閉じました。",
-      );
+      reconciledRef.current.delete(sid);
+      setCases((prev) => {
+        const next = { ...prev };
+        delete next[sid];
+        return next;
+      });
+      setActiveSessionId((prevActive) => {
+        if (prevActive !== sid) return prevActive;
+        // 残った中で先頭をアクティブに
+        const remaining = Object.keys(cases).filter((s) => s !== sid);
+        return remaining[0] ?? null;
+      });
     } catch (error) {
-      setLastResultMessage(
-        error instanceof Error ? error.message : "通信エラーが発生しました",
-      );
-    } finally {
-      setClosing(false);
+      patchCase(sid, {
+        closing: false,
+        lastResultMessage:
+          error instanceof Error ? error.message : "通信エラーが発生しました",
+      });
     }
   }
 
-  const caseLabel = loadedCase
-    ? `案件 ${loadedCase.recordNumber} | ${loadedCase.partnerName} | ${loadedCase.contractPlan}`
-    : "案件未選択";
+  const closeTargetCase = closeTargetSessionId
+    ? cases[closeTargetSessionId] ?? null
+    : null;
+  const closeTargetHasApplied = closeTargetCase
+    ? closeTargetCase.items.some((it) => it.status === "applied")
+    : false;
 
   return (
     <div className="flex flex-col h-[100dvh] min-h-[640px] min-w-[900px] bg-[#141414]">
@@ -787,33 +992,13 @@ export function DirectorWorkspace({
         <span className="font-semibold text-[#e8e8ea] whitespace-nowrap tracking-wider">
           AI-SITE-EDITOR
         </span>
-        <div className="h-5 w-px bg-[#2d2d31]" />
-        {/* 案件操作クラスタ: Loader と Close は同一の責務なので詰めて配置 */}
-        <div className="flex items-center gap-2">
-          <CaseLoader onLoaded={handleCaseLoaded} />
-          {loadedCase && (
-            <button
-              type="button"
-              onClick={() => setCloseModalOpen(true)}
-              disabled={closing || running || saving}
-              className="inline-flex items-center justify-center h-[30px] px-3 rounded-md border border-red-500/30 bg-transparent text-xs font-semibold text-red-300/80 hover:border-red-500/60 hover:bg-red-500/10 hover:text-red-200 disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:border-red-500/30 disabled:hover:text-red-300/80 transition whitespace-nowrap"
-            >
-              {closing ? "閉じ中..." : "案件を閉じる"}
-            </button>
-          )}
-        </div>
-        {(loadedCase || lastResultMessage) && (
-          <div className="h-5 w-px bg-[#2d2d31]" />
-        )}
-        {loadedCase && (
-          <span className="text-[#a9a9b0] truncate text-xs shrink-0 max-w-[30ch]">
-            {caseLabel}
-          </span>
-        )}
-        {lastResultMessage && (
-          <span className="flex-1 text-xs text-[#a9a9b0] truncate italic">
-            {lastResultMessage}
-          </span>
+        {activeCase?.lastResultMessage && (
+          <>
+            <div className="h-5 w-px bg-[#2d2d31]" />
+            <span className="flex-1 text-xs text-[#a9a9b0] truncate italic">
+              {activeCase.lastResultMessage}
+            </span>
+          </>
         )}
         <div className="ml-auto flex items-center gap-3 text-xs text-[#a9a9b0] whitespace-nowrap">
           {directorEmail && (
@@ -828,53 +1013,214 @@ export function DirectorWorkspace({
           </button>
         </div>
       </header>
-      {closeModalOpen && loadedCase && (
-        <CloseCaseModal
-          hasAppliedItems={hasAppliedItems}
-          onCancel={() => setCloseModalOpen(false)}
-          onDiscardAndClose={() => handleCloseCase(false)}
-          onSaveAndClose={() => handleCloseCase(true)}
+
+      {/* タブバー: 開いている案件を横一列、各タブに × と進捗ドット */}
+      <div className="flex items-center px-2 h-9 border-b border-[#2d2d31] bg-[#0f0f11] gap-1 overflow-x-auto shrink-0">
+        {Object.values(cases).map((c) => {
+          const isActive = c.loaded.sessionId === activeSessionId;
+          const busy =
+            c.running || c.saving || c.restartingDevServer || c.closing;
+          return (
+            <button
+              key={c.loaded.sessionId}
+              type="button"
+              onClick={() => setActiveSessionId(c.loaded.sessionId)}
+              className={`group flex items-center gap-2 px-3 h-7 rounded-md text-xs whitespace-nowrap border ${
+                isActive
+                  ? "bg-[#1b1b1d] text-[#e8e8ea] border-[#3a3a3f]"
+                  : "text-[#a9a9b0] hover:bg-[#1b1b1d] border-transparent"
+              }`}
+              title={`案件 ${c.loaded.recordNumber} | ${c.loaded.partnerName} | ${c.loaded.contractPlan}`}
+            >
+              <span className="font-medium">案件 {c.loaded.recordNumber}</span>
+              <span className="text-[#70707a] truncate max-w-[15ch]">
+                {c.loaded.partnerName}
+              </span>
+              {busy && (
+                <span
+                  className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse"
+                  aria-label="処理中"
+                />
+              )}
+              <span
+                role="button"
+                tabIndex={0}
+                aria-label="案件を閉じる"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setCloseTargetSessionId(c.loaded.sessionId);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.stopPropagation();
+                    setCloseTargetSessionId(c.loaded.sessionId);
+                  }
+                }}
+                className="ml-1 -mr-1 px-1 text-[#55555c] hover:text-red-300"
+              >
+                ×
+              </span>
+            </button>
+          );
+        })}
+        <button
+          type="button"
+          onClick={() => setCaseLoaderOpen(true)}
+          disabled={!canOpenMore}
+          title={
+            canOpenMore
+              ? "新しい案件を開く"
+              : `同時に開ける案件は最大 ${MAX_OPEN_CASES} 件です`
+          }
+          className="px-2 h-7 text-xs text-[#a9a9b0] hover:text-[#e8e8ea] disabled:opacity-40 disabled:hover:text-[#a9a9b0] whitespace-nowrap"
+        >
+          + 新規案件
+        </button>
+        <span className="ml-2 text-[10px] text-[#55555c] tabular-nums whitespace-nowrap">
+          {caseCount} / {MAX_OPEN_CASES}
+        </span>
+      </div>
+
+      {caseLoaderOpen && (
+        <CaseLoaderModal
+          onLoaded={handleCaseLoaded}
+          onCancel={() => setCaseLoaderOpen(false)}
         />
       )}
-      <div className="flex flex-1 min-h-0">
-        <div className="flex flex-col flex-1 min-w-0 min-h-0">
-          <PreviewPane
-            previewUrl={loadedCase?.previewUrl ?? null}
-            onElementSelected={handleElementSelected}
-            reloadKey={previewKey}
-            selectMode={selectMode}
-            onSelectModeReset={() => setSelectMode(false)}
-            onRestartDevServer={handleRestartDevServer}
-            restartingDevServer={restartingDevServer}
-            highlightSelectors={highlightSelectors}
-          />
-          <LogDrawer
-            entries={logEntries}
-            running={running}
-            onClear={() => setLogEntries([])}
-          />
-        </div>
-        <ChatPane
-          items={items}
-          pendingSelectors={pendingSelectors}
-          onRemovePendingSelector={handleRemovePendingSelector}
-          onSubmit={handleSubmitInstruction}
-          onRun={handleRun}
-          onRevert={handleRevert}
-          onDeleteDraft={handleDeleteDraft}
-          onSave={handleSave}
-          running={running}
-          saving={saving}
-          revertingItemId={revertingItemId}
-          hasAppliedItems={hasAppliedItems}
-          selectMode={selectMode}
-          onToggleSelectMode={() => setSelectMode((v) => !v)}
-          selectModeAvailable={!!loadedCase?.previewUrl}
-          activeHighlightItemId={activeHighlightItemId}
-          onToggleHighlight={(id) =>
-            setActiveHighlightItemId((cur) => (cur === id ? null : id))
+
+      {closeTargetSessionId && closeTargetCase && (
+        <CloseCaseModal
+          hasAppliedItems={closeTargetHasApplied}
+          recordNumber={closeTargetCase.loaded.recordNumber}
+          partnerName={closeTargetCase.loaded.partnerName}
+          onCancel={() => setCloseTargetSessionId(null)}
+          onDiscardAndClose={() =>
+            handleCloseCase(closeTargetSessionId, false)
           }
+          onSaveAndClose={() => handleCloseCase(closeTargetSessionId, true)}
         />
+      )}
+
+      <div className="flex flex-1 min-h-0">
+        {activeCase ? (
+          <>
+            <div className="flex flex-col flex-1 min-w-0 min-h-0">
+              <PreviewPane
+                previewUrl={activeCase.loaded.previewUrl}
+                onElementSelected={handleElementSelected}
+                reloadKey={activeCase.previewKey}
+                selectMode={activeCase.selectMode}
+                onSelectModeReset={() =>
+                  patchCase(activeCase.loaded.sessionId, { selectMode: false })
+                }
+                onRestartDevServer={() =>
+                  handleRestartDevServer(activeCase.loaded.sessionId)
+                }
+                restartingDevServer={activeCase.restartingDevServer}
+                highlightSelectors={highlightSelectors}
+              />
+              <LogDrawer
+                entries={activeCase.logEntries}
+                running={activeCase.running}
+                onClear={() =>
+                  patchCase(activeCase.loaded.sessionId, { logEntries: [] })
+                }
+              />
+            </div>
+            <ChatPane
+              items={activeCase.items}
+              pendingSelectors={activeCase.pendingSelectors}
+              onRemovePendingSelector={handleRemovePendingSelector}
+              onSubmit={handleSubmitInstruction}
+              onRun={handleRun}
+              onRevert={handleRevert}
+              onDeleteDraft={handleDeleteDraft}
+              onSave={handleSave}
+              running={activeCase.running}
+              saving={activeCase.saving}
+              revertingItemId={activeCase.revertingItemId}
+              selectMode={activeCase.selectMode}
+              onToggleSelectMode={() =>
+                patchCase(activeCase.loaded.sessionId, (c) => ({
+                  selectMode: !c.selectMode,
+                }))
+              }
+              selectModeAvailable={!!activeCase.loaded.previewUrl}
+              activeHighlightItemId={activeCase.activeHighlightItemId}
+              onToggleHighlight={(id) =>
+                patchCase(activeCase.loaded.sessionId, (c) => ({
+                  activeHighlightItemId:
+                    c.activeHighlightItemId === id ? null : id,
+                }))
+              }
+            />
+          </>
+        ) : (
+          <EmptyState
+            canOpenMore={canOpenMore}
+            onOpenLoader={() => setCaseLoaderOpen(true)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EmptyState({
+  canOpenMore,
+  onOpenLoader,
+}: {
+  canOpenMore: boolean;
+  onOpenLoader: () => void;
+}) {
+  return (
+    <div className="flex-1 flex items-center justify-center bg-[#141414]">
+      <div className="text-center">
+        <p className="text-sm text-[#a9a9b0]">案件が開かれていません</p>
+        <button
+          type="button"
+          onClick={onOpenLoader}
+          disabled={!canOpenMore}
+          className="mt-3 inline-flex items-center justify-center h-9 px-4 rounded-md bg-amber-500/90 text-[#0b0b0d] text-sm font-semibold hover:bg-amber-400 disabled:opacity-40 transition"
+        >
+          + 新規案件を開く
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CaseLoaderModal(props: {
+  onLoaded: (loaded: LoadedCase) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+      onClick={props.onCancel}
+      role="presentation"
+    >
+      <div
+        className="w-[560px] max-w-[92vw] rounded-lg border border-[#3a3a3f] bg-[#1f1f22] p-5 shadow-[0_20px_50px_-10px_rgba(0,0,0,0.7)]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="text-base font-semibold text-[#f0f0f2] tracking-wide mb-3">
+          新しい案件を開く
+        </h2>
+        <p className="text-xs text-[#a9a9b0] mb-3 leading-relaxed">
+          スプレッドシートに登録されているレコード番号を入力してください。
+          クリック後に Sandbox の起動 (clone → npm install → dev server) が走ります。
+        </p>
+        <CaseLoader onLoaded={props.onLoaded} />
+        <div className="mt-4 flex justify-end">
+          <button
+            type="button"
+            onClick={props.onCancel}
+            className="px-3 py-1.5 rounded-md border border-[#3a3a3f] bg-[#1b1b1d] text-xs text-[#a9a9b0] hover:border-[#55555c] hover:text-[#e8e8ea] transition"
+          >
+            キャンセル
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -882,6 +1228,8 @@ export function DirectorWorkspace({
 
 function CloseCaseModal(props: {
   hasAppliedItems: boolean;
+  recordNumber: string;
+  partnerName: string;
   onCancel: () => void;
   onDiscardAndClose: () => void;
   onSaveAndClose: () => void;
@@ -897,12 +1245,12 @@ function CloseCaseModal(props: {
         onClick={(e) => e.stopPropagation()}
       >
         <h2 className="text-base font-semibold text-[#f0f0f2] tracking-wide">
-          {props.hasAppliedItems ? "変更を保存しますか？" : "案件を閉じますか？"}
+          案件 {props.recordNumber} ({props.partnerName}) を閉じますか？
         </h2>
         <p className="mt-2 text-sm text-[#a9a9b0] leading-relaxed">
           {props.hasAppliedItems
-            ? "この案件には AI が適用した未保存の変更があります。保存せずに閉じると、Sandbox ごと破棄され変更は失われます。閉じると DB 上のこの案件の記録も削除されます（GitHub へ保存済みのコミットは残ります）。"
-            : "案件を閉じると Sandbox が停止し、DB 上のこの案件の記録も削除されます。他のディレクターが同じ案件を開けるようになります（ログイン情報は保持されます）。"}
+            ? "この案件には AI が適用した未保存の変更があります。保存せずに閉じると Sandbox ごと破棄され、変更は失われます。閉じると DB 上のこの案件の記録も削除されます (GitHub に保存済みのコミットは残ります)。"
+            : "案件を閉じると Sandbox が停止し、DB 上のこの案件の記録も削除されます。他のディレクターが同じ案件を開けるようになります。"}
         </p>
         <div className="mt-5 flex flex-col gap-2">
           {props.hasAppliedItems ? (

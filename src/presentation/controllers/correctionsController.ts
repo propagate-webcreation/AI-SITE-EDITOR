@@ -483,6 +483,20 @@ function summarizeArgs(name: string, args: Record<string, unknown>): string {
   }
 }
 
+/**
+ * agent 実行結果を解釈して commit → 状態確定までを行う。
+ *
+ * 「修正は成功したのに失敗扱い」になる事故を避けるため、
+ * 以下のすべての分岐で「編集が残っているなら commit して applied に昇格」を試みる:
+ *
+ * - success: 通常パス。commit が null なら "unclear"、sha なら "applied"
+ * - agentFailed (success: false / maxIterations 等): tracker に編集記録があれば
+ *   commit を試行。sha が出れば applied (summary に注記)、編集無しなら failed
+ * - runError (Gemini API throw 等): 同上。最終応答の手前で例外が出ても、
+ *   write_file/edit_file 直後ならファイルは sandbox に残っているので拾える
+ *
+ * commit 自体の throw は 1 回だけリトライして transient な失敗を吸収する。
+ */
 async function commitAndFinalize(
   slot: {
     inst: CorrectionInstructionInput;
@@ -500,72 +514,122 @@ async function commitAndFinalize(
   const { inst, created, tracker } = slot;
   const now = () => new Date();
 
-  if (outcome.kind === "runError") {
-    const msg =
-      outcome.error instanceof Error
-        ? outcome.error.message
-        : String(outcome.error);
-    return updateApp(created.id, {
-      status: "failed",
-      errorMessage: msg,
-      completedAt: now(),
-    });
+  let summary: string | null = null;
+  let outcomeError: string | null = null;
+  let agentSucceeded = false;
+  switch (outcome.kind) {
+    case "success":
+      summary = outcome.agentResult.finalMessage;
+      agentSucceeded = true;
+      break;
+    case "agentFailed":
+      summary = outcome.agentResult.finalMessage;
+      outcomeError =
+        outcome.agentResult.errorMessage ?? outcome.agentResult.finalMessage;
+      break;
+    case "runError":
+      outcomeError =
+        outcome.error instanceof Error
+          ? outcome.error.message
+          : String(outcome.error);
+      break;
   }
 
-  const agentResult = outcome.agentResult;
-
-  if (outcome.kind === "agentFailed") {
-    return updateApp(created.id, {
-      status: "failed",
-      errorMessage: agentResult.errorMessage ?? agentResult.finalMessage,
-      summary: agentResult.finalMessage,
-      completedAt: now(),
-    });
-  }
-
-  // run_bash が走った agent は tracker が touched path を把握できないので、
+  // run_bash (mutating) が走った agent は tracker が touched path を把握できないので、
   // pathSpec を指定せず全差分を対象にする。そうしないと sed/mv/cp 由来の
   // 変更が commit に入らず "判定不可" で終わってしまう。
   const touchedPaths = tracker.getTouchedPaths();
-  const usePathSpec = !tracker.hadRunCommand() && touchedPaths.length > 0;
-  let commitSha: string | null;
-  try {
-    commitSha = await deps.committer.commitOnly({
-      sandboxId: session.sandboxId,
-      authorName: deps.botAuthorName,
-      authorEmail: deps.botAuthorEmail,
-      commitMessage: buildCommitMessage({
-        recordNumber: session.recordNumber,
-        instructionId: inst.id,
-        pinIndex: inst.pinIndex,
-        comment: inst.comment,
-        summary: agentResult.finalMessage,
-      }),
-      pathSpec: usePathSpec ? touchedPaths : undefined,
-    });
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+  const hadBash = tracker.hadRunCommand();
+  const possiblyHasChanges = touchedPaths.length > 0 || hadBash;
+
+  // 編集も bash も走らずに agent が落ちたケース → commit する意味がない。
+  // success の場合は変更ゼロでも `git diff` で確認したい (commit が null を返して unclear に倒れる) ので、
+  // この早期 return は agent 失敗ケースに限定する。
+  if (!agentSucceeded && !possiblyHasChanges) {
     return updateApp(created.id, {
       status: "failed",
-      errorMessage: `AI 修正は完了しましたが commit に失敗: ${msg}`,
-      summary: agentResult.finalMessage,
+      errorMessage: outcomeError,
+      summary,
+      completedAt: now(),
+    });
+  }
+
+  const usePathSpec = !hadBash && touchedPaths.length > 0;
+  const commitArgs = {
+    sandboxId: session.sandboxId,
+    authorName: deps.botAuthorName,
+    authorEmail: deps.botAuthorEmail,
+    commitMessage: buildCommitMessage({
+      recordNumber: session.recordNumber,
+      instructionId: inst.id,
+      pinIndex: inst.pinIndex,
+      comment: inst.comment,
+      summary: summary ?? inst.comment,
+    }),
+    pathSpec: usePathSpec ? touchedPaths : undefined,
+  };
+
+  let commitSha: string | null = null;
+  let commitError: string | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      commitSha = await deps.committer.commitOnly(commitArgs);
+      commitError = null;
+      break;
+    } catch (error) {
+      commitError = error instanceof Error ? error.message : String(error);
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    }
+  }
+
+  if (commitError) {
+    const baseMsg = `commit に失敗 (${commitError})`;
+    const fullMsg = agentSucceeded
+      ? `AI 修正は完了しましたが ${baseMsg}`
+      : outcomeError
+        ? `${outcomeError} / さらに ${baseMsg}`
+        : baseMsg;
+    return updateApp(created.id, {
+      status: "failed",
+      errorMessage: fullMsg,
+      summary,
       completedAt: now(),
     });
   }
 
   if (commitSha === null) {
+    if (agentSucceeded) {
+      return updateApp(created.id, {
+        status: "unclear",
+        summary,
+        errorMessage:
+          "AI は変更すべき箇所を特定できませんでした。指示をもう少し具体的にするか、プレビュー上で対象要素を選択してから再送信してください。",
+        completedAt: now(),
+      });
+    }
     return updateApp(created.id, {
-      status: "unclear",
-      summary: agentResult.finalMessage,
-      errorMessage:
-        "AI は変更すべき箇所を特定できませんでした。指示をもう少し具体的にするか、プレビュー上で対象要素を選択してから再送信してください。",
+      status: "failed",
+      errorMessage: outcomeError,
+      summary,
       completedAt: now(),
     });
   }
 
+  // commit 成功。agent が graceful に終わらなかった場合は summary 冒頭に注記を付ける。
+  const finalSummary = agentSucceeded
+    ? summary
+    : [
+        `※ AI の応答が完了前に途切れましたが、編集内容は commit に保存しました (${outcomeError ?? "原因不明"})`,
+        summary,
+      ]
+        .filter((s): s is string => !!s)
+        .join("\n\n");
+
   return updateApp(created.id, {
     status: "applied",
-    summary: agentResult.finalMessage,
+    summary: finalSummary,
     commitSha,
     completedAt: now(),
   });

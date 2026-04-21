@@ -35,15 +35,8 @@ export function LogDrawer({ entries, running, onClear }: LogDrawerProps) {
   const [open, setOpen] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // 実行中は自動的に開く。ユーザーがあとから閉じた場合は尊重するため、
-  // open の初期化は "running 立ち上がり時だけ" にする。
-  const prevRunningRef = useRef(running);
-  useEffect(() => {
-    if (running && !prevRunningRef.current) setOpen(true);
-    prevRunningRef.current = running;
-  }, [running]);
-
-  // 新規 entry が来たら末尾にスクロール
+  // 開いている間だけ末尾追従スクロール。
+  // 自動 pull-up はしない (ユーザーが明示的にトグルバーを開くまで閉じたまま)。
   useEffect(() => {
     if (!open) return;
     const el = listRef.current;

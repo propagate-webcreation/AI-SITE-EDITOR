@@ -1,5 +1,8 @@
 import { Sandbox } from "@vercel/sandbox";
-import { DirectorWorkspace } from "@/presentation/components/DirectorWorkspace";
+import {
+  DirectorWorkspace,
+  type InitialSessionSummary,
+} from "@/presentation/components/DirectorWorkspace";
 import {
   createSupabaseAdminClient,
   createSupabaseServerClient,
@@ -14,7 +17,7 @@ export default async function HomePage() {
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
   let directorEmail: string | null = null;
-  let initialSession = null;
+  let initialSessions: InitialSessionSummary[] = [];
 
   if (url && anonKey && serviceRoleKey) {
     const supabase = await createSupabaseServerClient({
@@ -33,31 +36,39 @@ export default async function HomePage() {
       });
       const repo = new SupabaseSessionRepository(admin);
       const active = await repo.listActiveByDirector(data.user.id);
-      const latest = active[0];
-      if (latest) {
-        if (new Date(latest.expiresAt) <= new Date()) {
-          await markSessionExpired(repo, latest);
-        } else if (!(await isSandboxAlive(latest.sandboxId))) {
-          await markSessionExpired(repo, latest);
-        } else {
-          initialSession = {
-            sessionId: latest.id,
-            recordNumber: latest.recordNumber,
-            partnerName: latest.partnerName,
-            contractPlan: latest.contractPlan,
-            githubRepoUrl: latest.githubRepoUrl,
-            previewUrl: latest.previewUrl,
-            expiresAt: latest.expiresAt.toISOString(),
+      // 全アクティブ案件を初期タブとして UI に渡す。
+      // expired / dead sandbox はここで掃除して除外する。
+      const checks = await Promise.all(
+        active.map(async (s): Promise<InitialSessionSummary | null> => {
+          if (new Date(s.expiresAt) <= new Date()) {
+            await markSessionExpired(repo, s);
+            return null;
+          }
+          if (!(await isSandboxAlive(s.sandboxId))) {
+            await markSessionExpired(repo, s);
+            return null;
+          }
+          return {
+            sessionId: s.id,
+            recordNumber: s.recordNumber,
+            partnerName: s.partnerName,
+            contractPlan: s.contractPlan,
+            githubRepoUrl: s.githubRepoUrl,
+            previewUrl: s.previewUrl,
+            expiresAt: s.expiresAt.toISOString(),
           };
-        }
-      }
+        }),
+      );
+      initialSessions = checks.filter(
+        (s): s is InitialSessionSummary => s !== null,
+      );
     }
   }
 
   return (
     <DirectorWorkspace
       directorEmail={directorEmail}
-      initialSession={initialSession}
+      initialSessions={initialSessions}
     />
   );
 }

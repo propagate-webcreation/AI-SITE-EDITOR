@@ -395,6 +395,56 @@ export class VercelSandboxManager {
   }
 
   /**
+   * Sandbox 内で `tsc --noEmit` を走らせ、型エラーが残っていないか確認する。
+   * 「変更を保存」直前のゲートとして使い、型エラーがあれば push を中止する。
+   *
+   * - tsc が node_modules に無い場合は exit 127 を返してスキップ扱い (skipped: true)。
+   * - 出力 (stdout+stderr 結合) は ~6KB に丸めて返す。tsc は通常 stdout に出すので
+   *   片方だけだと取りこぼす可能性があり、必ず結合する。
+   * - timeout は 3 分 (大規模プロジェクトでも余裕を持たせる)。
+   */
+  async typeCheck(sandboxId: string): Promise<{
+    ok: boolean;
+    skipped: boolean;
+    output: string;
+    durationMs: number;
+  }> {
+    const sandbox = await Sandbox.get({
+      ...this.credsArg(),
+      sandboxId,
+    });
+    const start = Date.now();
+    const shellCmd = [
+      `cd ${DEFAULT_CWD}`,
+      `if [ ! -x node_modules/.bin/tsc ]; then ` +
+        `echo "tsc not installed in node_modules"; exit 127; ` +
+        `fi`,
+      `node_modules/.bin/tsc --noEmit --pretty false`,
+    ].join(" && ");
+    const res = await runAndCaptureStdout(sandbox, {
+      cmd: "bash",
+      args: ["-lc", shellCmd],
+      timeoutMs: 3 * 60 * 1000,
+    });
+    const durationMs = Date.now() - start;
+    const combined = `${res.stdout}${res.stderr}`.trim();
+    const MAX = 6000;
+    const output =
+      combined.length > MAX
+        ? `${combined.slice(0, MAX)}\n…(以下省略, 全 ${combined.length} 文字)`
+        : combined;
+    if (res.exitCode === 127) {
+      return {
+        ok: true,
+        skipped: true,
+        output: "tsc が sandbox の node_modules に存在しないためスキップしました",
+        durationMs,
+      };
+    }
+    return { ok: res.exitCode === 0, skipped: false, output, durationMs };
+  }
+
+  /**
    * 累積された未 push コミットを GitHub に force-push する。
    * 現在の HEAD を返す。
    */

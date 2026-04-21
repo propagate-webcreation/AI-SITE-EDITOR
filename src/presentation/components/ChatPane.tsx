@@ -60,7 +60,6 @@ interface ChatPaneProps {
   running: boolean;
   saving: boolean;
   revertingItemId: string | null;
-  hasAppliedItems: boolean;
   selectMode: boolean;
   onToggleSelectMode: () => void;
   selectModeAvailable: boolean;
@@ -82,7 +81,6 @@ export function ChatPane({
   running,
   saving,
   revertingItemId,
-  hasAppliedItems,
   selectMode,
   onToggleSelectMode,
   selectModeAvailable,
@@ -180,7 +178,7 @@ export function ChatPane({
           <button
             type="button"
             onClick={onSave}
-            disabled={saving || running || !hasAppliedItems}
+            disabled={saving || running}
             className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md border border-teal-500/60 bg-teal-500/5 text-teal-200 text-xs font-semibold hover:bg-teal-500/15 hover:text-teal-100 disabled:border-[#3a3a3f] disabled:bg-[#1b1b1d] disabled:text-[#55555c] transition whitespace-nowrap"
             title="Sandbox の修正を GitHub に push して本番デプロイを走らせます"
           >

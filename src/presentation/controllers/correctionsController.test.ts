@@ -254,6 +254,146 @@ describe("handleCorrectionsRequest (並列実行)", () => {
     expect(commitCallArgs?.pathSpec).toBeUndefined();
   });
 
+  it("agentFailed でも writeFile 履歴があれば commit を試みて applied に昇格", async () => {
+    const { deps } = makeDeps({
+      agentResults: [
+        { success: false, finalMessage: "途中まで作業", errorMessage: "rate limited" },
+      ],
+    });
+    (deps.runtimeProvider.getRuntime as ReturnType<typeof vi.fn>).mockResolvedValue({
+      readFile: vi.fn(),
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      writeBinaryFile: vi.fn(),
+      runCommand: vi.fn(),
+    });
+    (deps.agentRunner.run as ReturnType<typeof vi.fn>).mockImplementation(
+      async (input) => {
+        await input.sandbox.writeFile({ path: "app/page.tsx", content: "..." });
+        return {
+          success: false,
+          finalMessage: "途中まで作業",
+          errorMessage: "rate limited",
+          toolUseCount: 1,
+          iterations: 1,
+        };
+      },
+    );
+    const res = await handleCorrectionsRequest(
+      makeInput({ instructions: [{ id: "i1", comment: "page修正", pinIndex: 0 }] }),
+      deps,
+    );
+    expect(res.body.applications[0]?.status).toBe("applied");
+    expect(res.body.applications[0]?.summary).toContain("途切れました");
+    expect(res.body.applications[0]?.commitSha).toBeTruthy();
+    expect(deps.committer.commitOnly).toHaveBeenCalledTimes(1);
+  });
+
+  it("runError でも mutating bash 履歴があれば commit を試みて applied に昇格", async () => {
+    const { deps } = makeDeps();
+    (deps.runtimeProvider.getRuntime as ReturnType<typeof vi.fn>).mockResolvedValue({
+      readFile: vi.fn(),
+      writeFile: vi.fn(),
+      writeBinaryFile: vi.fn(),
+      runCommand: vi.fn().mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 }),
+    });
+    (deps.agentRunner.run as ReturnType<typeof vi.fn>).mockImplementation(
+      async (input) => {
+        await input.sandbox.runCommand({
+          cmd: "bash",
+          args: ["-lc", "sed -i s/a/b/ x"],
+        });
+        throw new Error("socket hang up");
+      },
+    );
+    const res = await handleCorrectionsRequest(
+      makeInput({ instructions: [{ id: "i1", comment: "sed書換", pinIndex: 0 }] }),
+      deps,
+    );
+    expect(res.body.applications[0]?.status).toBe("applied");
+    expect(res.body.applications[0]?.summary).toContain("socket hang up");
+    expect(res.body.applications[0]?.commitSha).toBeTruthy();
+    const commitArgs = (deps.committer.commitOnly as ReturnType<typeof vi.fn>)
+      .mock.calls[0]?.[0];
+    expect(commitArgs?.pathSpec).toBeUndefined();
+  });
+
+  it("agent 失敗 + 編集履歴ゼロなら commit せず failed のまま", async () => {
+    const { deps } = makeDeps({
+      agentResults: [
+        { success: false, finalMessage: "なにもできず", errorMessage: "boom" },
+      ],
+    });
+    const res = await handleCorrectionsRequest(
+      makeInput({ instructions: [{ id: "i1", comment: "X", pinIndex: 0 }] }),
+      deps,
+    );
+    expect(res.body.applications[0]?.status).toBe("failed");
+    expect(res.body.applications[0]?.errorMessage).toBe("boom");
+    expect(deps.committer.commitOnly).not.toHaveBeenCalled();
+  });
+
+  it("commit throw を 1 回リトライして成功すれば applied", async () => {
+    const { deps } = makeDeps({
+      commitResults: [new Error("transient git lock"), "shaRetry00000000000000000000000000000000"],
+    });
+    (deps.runtimeProvider.getRuntime as ReturnType<typeof vi.fn>).mockResolvedValue({
+      readFile: vi.fn(),
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      writeBinaryFile: vi.fn(),
+      runCommand: vi.fn(),
+    });
+    (deps.agentRunner.run as ReturnType<typeof vi.fn>).mockImplementation(
+      async (input) => {
+        await input.sandbox.writeFile({ path: "app/page.tsx", content: "..." });
+        return {
+          success: true,
+          finalMessage: "ok",
+          toolUseCount: 1,
+          iterations: 1,
+        };
+      },
+    );
+    const res = await handleCorrectionsRequest(
+      makeInput({ instructions: [{ id: "i1", comment: "X", pinIndex: 0 }] }),
+      deps,
+    );
+    expect(res.body.applications[0]?.status).toBe("applied");
+    expect(res.body.applications[0]?.commitSha).toBe(
+      "shaRetry00000000000000000000000000000000",
+    );
+    expect(deps.committer.commitOnly).toHaveBeenCalledTimes(2);
+  });
+
+  it("commit throw が 2 回続けば failed", async () => {
+    const { deps } = makeDeps({
+      commitResults: [new Error("disk full"), new Error("disk full")],
+    });
+    (deps.runtimeProvider.getRuntime as ReturnType<typeof vi.fn>).mockResolvedValue({
+      readFile: vi.fn(),
+      writeFile: vi.fn().mockResolvedValue(undefined),
+      writeBinaryFile: vi.fn(),
+      runCommand: vi.fn(),
+    });
+    (deps.agentRunner.run as ReturnType<typeof vi.fn>).mockImplementation(
+      async (input) => {
+        await input.sandbox.writeFile({ path: "app/page.tsx", content: "..." });
+        return {
+          success: true,
+          finalMessage: "ok",
+          toolUseCount: 1,
+          iterations: 1,
+        };
+      },
+    );
+    const res = await handleCorrectionsRequest(
+      makeInput({ instructions: [{ id: "i1", comment: "X", pinIndex: 0 }] }),
+      deps,
+    );
+    expect(res.body.applications[0]?.status).toBe("failed");
+    expect(res.body.applications[0]?.errorMessage).toContain("commit に失敗");
+    expect(deps.committer.commitOnly).toHaveBeenCalledTimes(2);
+  });
+
   it("read-only bash (mutating=false) だけなら writeFile 由来の pathSpec を維持", async () => {
     const { deps } = makeDeps();
     (deps.runtimeProvider.getRuntime as ReturnType<typeof vi.fn>).mockResolvedValue({

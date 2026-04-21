@@ -49,7 +49,8 @@ export async function GET(
     ? 200
     : result.code === "case-not-found"
       ? 404
-      : result.code === "session-conflict"
+      : result.code === "session-conflict" ||
+          result.code === "max-cases-reached"
         ? 409
         : result.code === "invalid-record-number" ||
             result.code === "missing-repo-url"

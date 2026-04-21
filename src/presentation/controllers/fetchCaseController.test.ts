@@ -58,7 +58,7 @@ function makeDeps(params: {
     getActiveByRecordNumber: vi
       .fn()
       .mockResolvedValue(params.activeSession ?? null),
-    listActiveByDirector: vi.fn(),
+    listActiveByDirector: vi.fn().mockResolvedValue([]),
     updateStatus: vi.fn(),
     deleteById: vi.fn(),
     getDirectorEmail: vi.fn().mockResolvedValue(null),
@@ -159,5 +159,36 @@ describe("fetchCaseByRecordNumber", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.code).toBe("session-conflict");
+  });
+
+  it("既に 5 案件開いていたら新規 open は max-cases-reached で拒否", async () => {
+    const deps = makeDeps();
+    // 既存 5 件のアクティブセッションを返すようにする
+    const fives = Array.from({ length: 5 }, (_, i) =>
+      sampleSession({ id: `sess-${i}`, recordNumber: `r-${i}` }),
+    );
+    (deps.sessions.listActiveByDirector as ReturnType<typeof vi.fn>)
+      .mockResolvedValue(fives);
+    const result = await fetchCaseByRecordNumber("999-new", deps);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe("max-cases-reached");
+    expect(deps.sandbox.createForCase).not.toHaveBeenCalled();
+    expect(deps.sessions.create).not.toHaveBeenCalled();
+  });
+
+  it("自分の既存セッション再開時は cap 判定をすり抜ける (5 件超でも OK)", async () => {
+    const existing = sampleSession({ directorId: "dir-A", recordNumber: "001" });
+    const deps = makeDeps({ activeSession: existing });
+    // 既存案件 5 件を返してもこの呼び出しは早期 return パスなので cap が効かない
+    const fives = Array.from({ length: 5 }, (_, i) =>
+      sampleSession({ id: `sess-${i}`, recordNumber: `r-${i}` }),
+    );
+    (deps.sessions.listActiveByDirector as ReturnType<typeof vi.fn>)
+      .mockResolvedValue(fives);
+    const result = await fetchCaseByRecordNumber("001", deps);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.session.id).toBe(existing.id);
   });
 });
