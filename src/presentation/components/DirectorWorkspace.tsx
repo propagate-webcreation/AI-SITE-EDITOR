@@ -1067,20 +1067,22 @@ export function DirectorWorkspace({
               key={c.loaded.sessionId}
               type="button"
               onClick={() => setActiveSessionId(c.loaded.sessionId)}
-              className={`group flex items-center gap-2 px-3 h-7 rounded-md text-xs whitespace-nowrap border ${
+              className={`group flex items-center gap-2 pl-3 pr-1 h-7 w-56 shrink-0 rounded-md text-xs whitespace-nowrap border ${
                 isActive
                   ? "bg-[#1b1b1d] text-[#e8e8ea] border-[#3a3a3f]"
                   : "text-[#a9a9b0] hover:bg-[#1b1b1d] border-transparent"
               }`}
               title={`案件 ${c.loaded.recordNumber} | ${c.loaded.partnerName} | ${c.loaded.contractPlan}`}
             >
-              <span className="font-medium">案件 {c.loaded.recordNumber}</span>
-              <span className="text-[#70707a] truncate max-w-[15ch]">
+              <span className="font-medium shrink-0">
+                案件 {c.loaded.recordNumber}
+              </span>
+              <span className="text-[#70707a] truncate min-w-0 flex-1 text-left">
                 {c.loaded.partnerName}
               </span>
               {busy && (
                 <span
-                  className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse"
+                  className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse shrink-0"
                   aria-label="処理中"
                 />
               )}
@@ -1098,7 +1100,7 @@ export function DirectorWorkspace({
                     setCloseTargetSessionId(c.loaded.sessionId);
                   }
                 }}
-                className="ml-1 -mr-1 px-1 text-[#55555c] hover:text-red-300"
+                className="shrink-0 px-1 text-[#55555c] hover:text-red-300"
               >
                 ×
               </span>
