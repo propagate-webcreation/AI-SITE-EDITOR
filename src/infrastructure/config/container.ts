@@ -44,10 +44,10 @@ export async function buildCaseLoadingContainer(): Promise<CaseLoadingContainer>
   const spreadsheet = new GoogleSheetsClient({
     spreadsheetId: env.googleSheets.spreadsheetId,
     sheetName: env.googleSheets.sheetName,
-    credentialsPath: path.resolve(
-      process.cwd(),
-      env.googleSheets.credentialsPath,
-    ),
+    credentialsJson: env.googleSheets.credentialsJson,
+    credentialsPath: env.googleSheets.credentialsPath
+      ? path.resolve(process.cwd(), env.googleSheets.credentialsPath)
+      : undefined,
   });
 
   const sandbox = new VercelSandboxManager({

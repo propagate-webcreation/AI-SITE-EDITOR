@@ -29,7 +29,8 @@ export const DEFAULT_HEADER_LABELS: GoogleSheetsHeaderLabels = {
 export interface GoogleSheetsClientConfig {
   spreadsheetId: string;
   sheetName: string;
-  credentialsPath: string;
+  credentialsPath?: string;
+  credentialsJson?: string;
   headerLabels?: GoogleSheetsHeaderLabels;
 }
 
@@ -46,7 +47,7 @@ export class GoogleSheetsClient implements SpreadsheetPort {
   private columnIndexCache: ColumnIndexMap | null = null;
 
   constructor(private readonly config: GoogleSheetsClientConfig) {
-    const credentials = loadServiceAccountCredentials(config.credentialsPath);
+    const credentials = resolveServiceAccountCredentials(config);
     const jwt = new JWT({
       email: credentials.client_email,
       key: credentials.private_key,
@@ -167,17 +168,38 @@ function cellAt(row: string[], index: number): string {
   return typeof v === "string" ? v : "";
 }
 
-function loadServiceAccountCredentials(filePath: string): ServiceAccountCredentials {
-  const raw = readFileSync(filePath, "utf8");
-  const parsed = JSON.parse(raw) as Partial<ServiceAccountCredentials>;
+function resolveServiceAccountCredentials(
+  config: GoogleSheetsClientConfig,
+): ServiceAccountCredentials {
+  if (config.credentialsJson) {
+    return parseServiceAccountJson(config.credentialsJson, "GOOGLE_SHEETS_CREDENTIALS_JSON");
+  }
+  if (config.credentialsPath) {
+    const raw = readFileSync(config.credentialsPath, "utf8");
+    return parseServiceAccountJson(raw, config.credentialsPath);
+  }
+  throw new Error(
+    "GoogleSheetsClient: credentialsJson または credentialsPath のいずれかが必要です。",
+  );
+}
+
+function parseServiceAccountJson(raw: string, source: string): ServiceAccountCredentials {
+  let parsed: Partial<ServiceAccountCredentials>;
+  try {
+    parsed = JSON.parse(raw) as Partial<ServiceAccountCredentials>;
+  } catch (error) {
+    throw new Error(
+      `GoogleSheetsClient: ${source} の JSON 解析に失敗しました: ${(error as Error).message}`,
+    );
+  }
   if (!parsed.client_email || !parsed.private_key) {
     throw new Error(
-      `GoogleSheetsClient: ${filePath} に client_email / private_key が含まれていません。`,
+      `GoogleSheetsClient: ${source} に client_email / private_key が含まれていません。`,
     );
   }
   return {
     client_email: parsed.client_email,
-    private_key: parsed.private_key,
+    private_key: parsed.private_key.replace(/\\n/g, "\n"),
   };
 }
 

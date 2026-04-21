@@ -20,7 +20,8 @@ export interface AppEnv {
   googleSheets: {
     spreadsheetId: string;
     sheetName: string;
-    credentialsPath: string;
+    credentialsPath: string | undefined;
+    credentialsJson: string | undefined;
   } | null;
 
   doneStatus: string;
@@ -64,10 +65,11 @@ function readGoogleSheetsConfig(): AppEnv["googleSheets"] {
   const spreadsheetId = readOptional("GOOGLE_SHEETS_SPREADSHEET_ID");
   const sheetName = readOptional("GOOGLE_SHEETS_SHEET_NAME");
   const credentialsPath = readOptional("GOOGLE_SHEETS_CREDENTIALS_PATH");
-  if (!spreadsheetId || !sheetName || !credentialsPath) {
+  const credentialsJson = readOptional("GOOGLE_SHEETS_CREDENTIALS_JSON");
+  if (!spreadsheetId || !sheetName || (!credentialsPath && !credentialsJson)) {
     return null;
   }
-  return { spreadsheetId, sheetName, credentialsPath };
+  return { spreadsheetId, sheetName, credentialsPath, credentialsJson };
 }
 
 function readSupabaseConfig(): AppEnv["supabase"] {
@@ -126,7 +128,7 @@ export function assertCaseLoadingEnv(env: AppEnv): asserts env is AppEnv & {
   if (!env.githubToken) missing.push("GITHUB_TOKEN");
   if (!env.googleSheets)
     missing.push(
-      "GOOGLE_SHEETS_SPREADSHEET_ID / _SHEET_NAME / _CREDENTIALS_PATH",
+      "GOOGLE_SHEETS_SPREADSHEET_ID / _SHEET_NAME / (_CREDENTIALS_JSON or _CREDENTIALS_PATH)",
     );
   if (!env.supabase)
     missing.push(
