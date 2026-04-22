@@ -110,7 +110,11 @@ interface ParsedBody {
   instructions: CorrectionInstructionInput[];
 }
 
-const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+// Vercel Function の request body は 4.5 MB hard limit (FUNCTION_PAYLOAD_TOO_LARGE)。
+// 関数本体に届く前に edge で 413 されるのを避けるため、1 添付あたりの上限は 4 MB に
+// 抑える。client 側は compressImageForUpload で送信前に長辺 2048px / JPEG q=0.85 へ
+// 縮小しているので、Mac の Retina スクリーンショット (10 MB+) でも通常はこの値に収まる。
+const MAX_ATTACHMENT_BYTES = 4 * 1024 * 1024;
 const ACCEPTED_MIME_PREFIXES = ["image/"];
 
 /**
@@ -795,7 +799,9 @@ export async function parseCorrectionsBody(
         if (!filename || !mimeType || !base64) continue;
         if (!ACCEPTED_MIME_PREFIXES.some((p) => mimeType.startsWith(p))) continue;
         if (base64.length > (MAX_ATTACHMENT_BYTES * 4) / 3) {
-          return { error: `添付ファイル ${filename} が大きすぎます (上限 8MB)` };
+          return {
+            error: `添付ファイル ${filename} が大きすぎます (上限 ${MAX_ATTACHMENT_BYTES / (1024 * 1024)}MB)。ブラウザを再読み込みしてもう一度試すか、画像を JPEG に変換 / 縮小してから添付してください。`,
+          };
         }
         attachments.push({ filename, mimeType, base64 });
       }

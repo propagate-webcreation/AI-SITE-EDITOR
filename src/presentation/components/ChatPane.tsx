@@ -7,6 +7,7 @@ import {
   type DragEvent,
   type FormEvent,
 } from "react";
+import { compressImageForUpload } from "./imageCompression";
 
 export interface ChatAttachment {
   filename: string;
@@ -92,6 +93,8 @@ export function ChatPane({
   const [isGlobal, setIsGlobal] = useState(false);
   const [previewUrls, setPreviewUrls] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [compressing, setCompressing] = useState(false);
   const dragDepthRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -103,10 +106,34 @@ export function ChatPane({
     };
   }, [files]);
 
-  function addFiles(incoming: File[]): void {
-    const images = incoming.filter((f) => f.type.startsWith("image/"));
-    if (images.length === 0) return;
-    setFiles((prev) => [...prev, ...images]);
+  async function addFiles(incoming: File[]): Promise<void> {
+    // 空 type で来るケース (Mac Chrome の HEIC 等) も拾えるよう、
+    // 拡張子フォールバックで image/ 系の可能性があるものは通す。
+    const images = incoming.filter(
+      (f) => f.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|heic|heif|bmp)$/i.test(f.name),
+    );
+    if (images.length === 0) {
+      setAttachmentError("画像ファイルとして認識できませんでした。");
+      return;
+    }
+    setAttachmentError(null);
+    setCompressing(true);
+    const compressed: File[] = [];
+    const errors: string[] = [];
+    for (const f of images) {
+      try {
+        compressed.push(await compressImageForUpload(f));
+      } catch (e) {
+        errors.push(e instanceof Error ? e.message : String(e));
+      }
+    }
+    setCompressing(false);
+    if (compressed.length > 0) {
+      setFiles((prev) => [...prev, ...compressed]);
+    }
+    if (errors.length > 0) {
+      setAttachmentError(errors.join("\n"));
+    }
   }
 
   function handleRemoveFile(index: number): void {
@@ -427,6 +454,24 @@ export function ChatPane({
           placeholder="修正内容を日本語で..."
           className="w-full flex-1 min-h-0 rounded-md bg-[#0f0f11] border border-[#2d2d31] p-3 text-sm text-[#e8e8ea] placeholder:text-[#55555c] focus:outline-none focus:border-amber-500/50 transition resize-none"
         />
+        {compressing && (
+          <p className="text-[11px] text-amber-300 px-1">
+            画像を圧縮中…
+          </p>
+        )}
+        {attachmentError && (
+          <div className="flex items-start gap-2 rounded-md border border-red-500/40 bg-red-500/5 px-2 py-1.5 text-[11px] text-red-300 whitespace-pre-wrap">
+            <span className="flex-1">{attachmentError}</span>
+            <button
+              type="button"
+              onClick={() => setAttachmentError(null)}
+              aria-label="エラーを閉じる"
+              className="text-red-300/70 hover:text-red-200"
+            >
+              ×
+            </button>
+          </div>
+        )}
         {files.length > 0 && (
           <div className="flex flex-wrap gap-2">
             {files.map((f, i) => (

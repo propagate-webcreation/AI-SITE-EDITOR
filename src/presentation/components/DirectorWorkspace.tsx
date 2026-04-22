@@ -734,14 +734,23 @@ export function DirectorWorkspace({
       });
       bumpPreview(sid);
     } catch (error) {
-      patchCase(sid, {
-        lastResultMessage:
-          error instanceof Error ? error.message : "通信エラーが発生しました",
+      const message =
+        error instanceof Error ? error.message : "通信エラーが発生しました";
+      pushLog(sid, {
+        kind: "log",
+        headline: "AI 修正の実行に失敗",
+        detail: message,
+        error: true,
       });
+      patchCase(sid, { lastResultMessage: message });
       updateCaseItems(sid, (prev) =>
         prev.map((it) =>
           it.status === "submitted"
-            ? { ...it, status: "failed" as const }
+            ? {
+                ...it,
+                status: "failed" as const,
+                errorMessage: it.errorMessage ?? message,
+              }
             : it,
         ),
       );
